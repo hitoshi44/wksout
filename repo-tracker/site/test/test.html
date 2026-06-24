@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>repo-tracker tests</title>
+  <link rel="stylesheet" href="../vendor/water.min.css">
+  <style>
+    ul { list-style: none; padding-left: 0; }
+    li { font-family: monospace; font-size: 0.9rem; padding: 0.1rem 0; }
+  </style>
+</head>
+<body>
+  <h1>repo-tracker tests</h1>
+  <p>ローカルで <code>python -m http.server</code> を repo ルートで起動して
+     <code>/site/test/test.html</code> を開く。</p>
+  <div id="results"></div>
+
+  <script type="module">
+    // テストファイルをまず import すると、各ファイル内で test(...) が登録される。
+    await import('./grep.test.js');
+    await import('./render.test.js');
+    await import('./router.test.js');
+    await import('./repos.test.js');
+    await import('./parsed_search.test.js');
+    await import('./templates.test.js');
+    await import('./search.test.js');
+    const { run } = await import('./runner.js');
+    await run(document.getElementById('results'));
+  </script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# repo-tracker: 追跡対象 repo の一覧 (sh 出力前提)
+#
+# 形式: id,url[,nest]
+#   id   GitLab project id (記録用、fetcher は使わない)
+#   url  GitLab の repo URL (config.gitlab.url 配下)
+#   nest 省略時は config.defaults.nest を使用。0 で root のみ、1 で root + 直下 tree
+
+61415567,https://gitlab.com/gitlab-org/cli
+9970,https://gitlab.com/gitlab-org/gitlab-svgs,1

@@ -1,0 +1,24 @@
+# repo-tracker config (example)
+# 実利用時は `cp config.example.yml config.yml` してから編集する。
+# config.yml と repos.csv は .gitignore で無視。
+
+gitlab:
+  url: https://gitlab.com
+  token_env: GITLAB_TOKEN
+
+defaults:
+  nest: 1                 # repos.csv で nest 省略時のデフォルト深さ
+
+repos_file: repos.csv     # CSV パス (config.yml と同じディレクトリ基準で解決)
+output_dir: site/data     # 出力先 (同上、相対なら config.yml と同じディレクトリ基準)
+
+# ci_templates (任意): repos.csv とは別系統の収集。
+# ここに挙げた「CI テンプレ配布リポ」ごとに README と templates_dir 配下の
+# *.yml / *.yaml を集め、各 yml が参照する環境変数 (CI_* は除外) を抽出して
+# templates.json に出力する。サイトの #/templates ビューが読む。
+# セクションを省略すればこの処理はスキップされる。
+# ci_templates:
+#   - repo: group/ci-templates   # project path か numeric id
+#     readme: README.md          # README のパス (任意)
+#     templates_dir: templates   # この配下の yml を 1 ファイル=1 テンプレとして収集
+#     ref: main                  # 任意。省略時は default branch
