@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GitLab CI ジョブ履歴（jobs_all.tsv）から runner の占有状況を集計する。
+標準ライブラリのみ（Python 3.11 以上）。
+
+使い方:
+  python ci_usage.py jobs_all.tsv
+  python ci_usage.py jobs_all.tsv --capacity 8            # runner 枠の合計が分かる場合
+  python ci_usage.py jobs_all.tsv --tags "*docker*"       # タグ（runner プール）で絞る
+  python ci_usage.py jobs_all.tsv --exclude "123:e2e-*" --exclude "*:nightly-*"
+                                                          # 「プロジェクトID:ジョブ名」で削った場合を試算
+
+出力（--outdir、既定 report/）:
+  report.html        グラフと表のまとめ（ブラウザで開く）
+  weekly.csv         週別の占有時間・同時実行数・待ち時間
+  jobs_ranking.csv   ジョブ別の占有時間（混雑時間帯の占有順）
+  jobs_monthly.csv   上位ジョブの月別占有時間
+  tags.csv           タグ（runner プール）別の占有時間
+  whatif_weekly.csv  --exclude を指定したときの週別比較
+
+考え方:
+  - 占有時間 = ジョブの started_at〜finished_at の合計（runner の枠を埋めていた時間）
+  - 同時実行数 = その時点で走っていたジョブ数
+  - 混雑時間帯 = 1 時間平均の同時実行数が全時間の上位 --busy-pct %（既定 10%）の時間
+  - CPU・メモリ使用量そのものではない点に注意
+"""
+import argparse
+import csv
+import fnmatch
+import html
+import math
+import os
+import sys
+from collections import Counter, defaultdict
+from datetime import date, datetime, timedelta
+
+COLS = ["project", "pipeline_id", "job_id", "name", "stage", "status", "duration",
+        "queued_duration", "created_at", "started_at", "finished_at", "runner_id",
+        "runner", "tags"]
+EPOCH = date(1970, 1, 1)
+WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
+
+
+# ------------------------------------------------------------------ 読み込み
+class Job:
+    __slots__ = ("jid", "project", "name", "stage", "status", "s", "e", "queued", "tags")
+
+    @property
+    def key(self):
+        return (self.project, self.name)
+
+
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        return None
+
+
+def to_float(s):
+    try:
+        return float(s) if s else None
+    except ValueError:
+        return None
+
+
+def load(path, tzoff):
+    """job_id で重複除去しながら読む。時刻はすべて「ローカル時刻の秒」に変換する。"""
+    best = {}
+    rows = 0
+    with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        for row in csv.reader(f, delimiter="\t", quoting=csv.QUOTE_NONE):
+            if not row or row[0] == "project":   # sort -u でヘッダが途中に混ざっても飛ばす
+                continue
+            if len(row) < len(COLS):
+                row = row + [""] * (len(COLS) - len(row))
+            r = dict(zip(COLS, row))
+            try:
+                jid = int(r["job_id"])
+            except ValueError:
+                continue
+            rows += 1
+            s, e = parse_ts(r["started_at"]), parse_ts(r["finished_at"])
+            j = Job()
+            j.jid, j.project, j.name, j.stage, j.status = jid, r["project"], r["name"], r["stage"], r["status"]
+            j.s = s + tzoff if s is not None else None
+            j.e = e + tzoff if e is not None else None
+            j.queued = to_float(r["queued_duration"])
+            j.tags = r["tags"]
+            old = best.get(jid)
+            # 同じジョブが複数期間に出たら、終了しているほうを採用
+            if old is None or (old.e is None and j.e is not None):
+                best[jid] = j
+    return rows, list(best.values())
+
+
+# ------------------------------------------------------------------ 計算
+def percentile(sorted_vals, p):
+    if not sorted_vals:
+        return None
+    k = max(0, min(len(sorted_vals) - 1, math.ceil(p / 100 * len(sorted_vals)) - 1))
+    return sorted_vals[k]
+
+
+def concurrency(jobs, h0, n, need_busy=True):
+    """1 時間ごとの占有秒（busy）と最大同時実行数（hmax）を返す。"""
+    busy = [0.0] * n if need_busy else None
+    hmax = [0] * n
+    ev = []
+    for j in jobs:
+        ev.append((j.s, 1))
+        ev.append((j.e, -1))
+        if need_busy:
+            s, e = j.s, j.e
+            for h in range(int(s // 3600), int(e // 3600) + 1):
+                ov = min(e, (h + 1) * 3600) - max(s, h * 3600)
+                if ov > 0:
+                    busy[h - h0] += ov
+    ev.sort()  # 同時刻は終了(-1)を先に
+    cur, last = 0, 0
+    for t, d in ev:
+        h = int(t // 3600) - h0
+        if h > last:
+            for k in range(last + 1, h + 1):
+                if cur > hmax[k]:
+                    hmax[k] = cur
+            last = h
+        cur += d
+        if cur > hmax[h]:
+            hmax[h] = cur
+    return busy, hmax
+
+
+_day_cache = {}
+
+
+def day_info(day):
+    v = _day_cache.get(day)
+    if v is None:
+        d = EPOCH + timedelta(days=day)
+        wd = d.weekday()
+        v = (d, wd, day - wd, d.strftime("%Y-%m"))
+        _day_cache[day] = v
+    return v  # (日付, 曜日0=月, 週の月曜の通し日, "YYYY-MM")
+
+
+def weekly_table(busy, hmax, busyset, h0, jobs):
+    weeks = {}
+    for k in range(len(hmax)):
+        _, _, wk, _ = day_info((h0 + k) // 24)
+        w = weeks.get(wk)
+        if w is None:
+            w = weeks[wk] = {"hours": 0, "busy": 0.0, "peak": 0, "busyh": 0, "jobs": 0, "queued": []}
+        w["hours"] += 1
+        if busy is not None:
+            w["busy"] += busy[k]
+        w["peak"] = max(w["peak"], hmax[k])
+        if busyset is not None and busyset[k]:
+            w["busyh"] += 1
+    if jobs is not None:
+        for j in jobs:
+            _, _, wk, _ = day_info(int(j.s // 86400))
+            w = weeks.get(wk)
+            if w:
+                w["jobs"] += 1
+                if j.queued is not None:
+                    w["queued"].append(j.queued)
+    out = []
+    for wk in sorted(weeks):
+        w = weeks[wk]
+        q = sorted(w["queued"])
+        out.append({
+            "week": (EPOCH + timedelta(days=wk)).isoformat(),
+            "jobs": w["jobs"],
+            "runner_h": w["busy"] / 3600,
+            "avg_conc": w["busy"] / (w["hours"] * 3600) if w["hours"] else 0,
+            "peak_conc": w["peak"],
+            "busy_hours": w["busyh"],
+            "queued_p50_s": percentile(q, 50),
+            "queued_p95_s": percentile(q, 95),
+        })
+    return out
+
+
+# ------------------------------------------------------------------ HTML 部品
+def nice_ceil(v):
+    if v <= 0:
+        return 1
+    e = 10 ** math.floor(math.log10(v))
+    for m in (1, 2, 2.5, 5, 10):
+        if v <= m * e:
+            return m * e
+    return 10 * e
+
+
+def fnum(v, d=1):
+    if v is None:
+        return "-"
+    if abs(v) >= 100:
+        return f"{v:,.0f}"
+    return f"{v:,.{d}f}"
+
+
+def svg_line(title, unit, labels, series, height=250):
+    W, H, L, R, T, B = 920, height, 60, 16, 34, 42
+    vals = [v for _, vs, _ in series for v in vs if v is not None]
+    ymax = nice_ceil(max(vals) if vals else 1)
+    n = len(labels)
+
+    def x(i):
+        return L + (W - L - R) * (i / (n - 1) if n > 1 else 0.5)
+
+    def y(v):
+        return T + (H - T - B) * (1 - v / ymax)
+
+    p = [f'<svg viewBox="0 0 {W} {H}" class="chart" role="img" aria-label="{html.escape(title)}">',
+         f'<text x="{L}" y="18" class="ttl">{html.escape(title)}</text>',
+         f'<text x="{W - R}" y="18" class="ax" text-anchor="end">{html.escape(unit)}</text>']
+    for g in range(5):
+        v = ymax * g / 4
+        yy = y(v)
+        p.append(f'<line x1="{L}" x2="{W - R}" y1="{yy:.1f}" y2="{yy:.1f}" class="grid"/>')
+        p.append(f'<text x="{L - 6}" y="{yy + 4:.1f}" class="ax" text-anchor="end">{fnum(v)}</text>')
+    step = max(1, math.ceil(n / 10))
+    for i in range(0, n, step):
+        p.append(f'<text x="{x(i):.1f}" y="{H - B + 18}" class="ax" text-anchor="middle">{html.escape(labels[i])}</text>')
+    lx = L
+    for name, vs, color in series:
+        pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(vs) if v is not None)
+        p.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2"/>')
+        p.append(f'<rect x="{lx}" y="{H - 14}" width="12" height="4" fill="{color}"/>'
+                 f'<text x="{lx + 16}" y="{H - 9}" class="ax">{html.escape(name)}</text>')
+        lx += 30 + 13 * len(name)
+    p.append("</svg>")
+    return "".join(p)
+
+
+def heatmap(cells):
+    """cells[wd][hour] = 平均同時実行数"""
+    mx = max((v for row in cells for v in row), default=0) or 1
+    h = ['<table class="heat"><tr><th></th>' + "".join(f"<th>{i}</th>" for i in range(24)) + "</tr>"]
+    for wd in range(7):
+        h.append(f"<tr><th>{WEEKDAYS[wd]}</th>")
+        for v in cells[wd]:
+            a = v / mx
+            fg = "#fff" if a > 0.55 else "inherit"
+            h.append(f'<td style="background:rgba(37,99,235,{a:.2f});color:{fg}">{v:.1f}</td>')
+        h.append("</tr>")
+    h.append("</table>")
+    return "".join(h)
+
+
+def table(headers, rows, num_from=1):
+    h = ["<div class='tw'><table><tr>" + "".join(f"<th>{html.escape(x)}</th>" for x in headers) + "</tr>"]
+    for r in rows:
+        h.append("<tr>" + "".join(
+            f"<td class='{'n' if i >= num_from else ''}'>{c if isinstance(c, str) and c.startswith('<') else html.escape(str(c))}</td>"
+            for i, c in enumerate(r)) + "</tr>")
+    h.append("</table></div>")
+    return "".join(h)
+
+
+def bar(pct):
+    return f"<span class='bar'><span style='width:{min(100, pct):.1f}%'></span></span> {pct:.1f}%"
+
+
+CSS = """
+body{font-family:system-ui,-apple-system,"Segoe UI","Hiragino Sans","Yu Gothic UI",sans-serif;
+ margin:0;background:#f7f7f5;color:#1f2328;line-height:1.6}
+main{max-width:980px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:1.5rem;margin:0 0 4px}h2{font-size:1.15rem;margin:36px 0 8px;border-bottom:1px solid #ddd;padding-bottom:4px}
+.sub{color:#666;font-size:.9rem}.note{color:#555;font-size:.85rem}
+.kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin:16px 0}
+.kpi div{background:#fff;border:1px solid #e3e3e0;border-radius:8px;padding:10px 12px}
+.kpi b{display:block;font-size:1.3rem}.kpi span{font-size:.8rem;color:#666}
+.chart{width:100%;height:auto;background:#fff;border:1px solid #e3e3e0;border-radius:8px;margin:8px 0}
+.chart .grid{stroke:#eee}.chart .ax{font-size:11px;fill:#666}.chart .ttl{font-size:13px;font-weight:600;fill:#1f2328}
+.tw{overflow-x:auto}table{border-collapse:collapse;font-size:.85rem;background:#fff}
+th,td{border:1px solid #e3e3e0;padding:4px 8px;white-space:nowrap}th{background:#f0f0ec;text-align:left}
+td.n{text-align:right}.heat td{text-align:center;font-size:.75rem;padding:3px 4px;min-width:26px}
+.bar{display:inline-block;width:80px;height:8px;background:#eee;border-radius:4px;vertical-align:middle}
+.bar span{display:block;height:100%;background:#2563eb;border-radius:4px}
+"""
+
+
+# ------------------------------------------------------------------ メイン
+def main():
+    ap = argparse.ArgumentParser(description="GitLab CI ジョブ履歴の runner 占有集計")
+    ap.add_argument("input", nargs="?", default="jobs_all.tsv")
+    ap.add_argument("--tz", type=float, default=9, help="表示タイムゾーンの UTC からの時差（既定 9）")
+    ap.add_argument("--capacity", type=float, help="runner の同時実行枠の合計（分かれば稼働率を出す）")
+    ap.add_argument("--tags", help="タグで絞る（glob、例: '*docker*'。タグなしは ''）")
+    ap.add_argument("--exclude", action="append", default=[],
+                    help="削る想定のジョブ 'プロジェクトID:ジョブ名'（glob 可、複数指定可）")
+    ap.add_argument("--busy-pct", type=float, default=10, help="混雑時間帯とみなす上位 %%（既定 10）")
+    ap.add_argument("--top", type=int, default=30, help="ランキングの表示件数（既定 30）")
+    ap.add_argument("--effect-top", type=int, default=10, help="個別に削減効果を計算する件数（既定 10）")
+    ap.add_argument("--outdir", default="report")
+    a = ap.parse_args()
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+
+    tzoff = a.tz * 3600
+    rows, alljobs = load(a.input, tzoff)
+    usable = [j for j in alljobs if j.s is not None and j.e is not None and j.e > j.s]
+    n_nostart = sum(1 for j in alljobs if j.s is None)
+    n_running = sum(1 for j in alljobs if j.s is not None and j.e is None)
+    print(f"読み込み: {rows:,} 行 / 重複除去後 {len(alljobs):,} ジョブ / 集計対象 {len(usable):,}")
+    if not usable:
+        sys.exit("集計対象のジョブがありません")
+
+    # --- タグ（runner プール）別 ---
+    tagstat = defaultdict(lambda: {"sec": 0.0, "n": 0, "proj": set(), "jobs": []})
+    for j in usable:
+        t = tagstat[j.tags]
+        t["sec"] += j.e - j.s
+        t["n"] += 1
+        t["proj"].add(j.project)
+        t["jobs"].append(j)
+    tag_total = sum(t["sec"] for t in tagstat.values())
+    tag_rows = []
+    for tags, t in sorted(tagstat.items(), key=lambda kv: -kv[1]["sec"]):
+        share = t["sec"] / tag_total * 100
+        peak = p99 = None
+        if share >= 1 and len(tag_rows) < 10:
+            tj = t["jobs"]
+            th0 = int(min(j.s for j in tj) // 3600)
+            tn = int(max(j.e for j in tj) // 3600) - th0 + 1
+            _, thm = concurrency(tj, th0, tn, need_busy=False)
+            s = sorted(thm)
+            peak, p99 = s[-1], percentile(s, 99)
+        tag_rows.append([tags or "(タグなし)", t["n"], t["sec"] / 3600, share, len(t["proj"]), peak, p99])
+
+    if a.tags is not None:
+        usable = [j for j in usable if fnmatch.fnmatchcase(j.tags, a.tags)]
+        print(f"タグ '{a.tags}' で絞り込み: {len(usable):,} ジョブ")
+        if not usable:
+            sys.exit("該当するジョブがありません")
+
+    # --- 全体の同時実行 ---
+    h0 = int(min(j.s for j in usable) // 3600)
+    n = int(max(j.e for j in usable) // 3600) - h0 + 1
+    busy, hmax = concurrency(usable, h0, n)
+    avgc = [b / 3600 for b in busy]
+    thr = percentile(sorted(avgc), 100 - a.busy_pct) or 0
+    busyset = [v >= thr and v > 0 for v in avgc]
+    nb = sum(busyset)
+    total_sec = sum(busy)
+    busy_sec = sum(b for b, f in zip(busy, busyset) if f)
+    hs = sorted(hmax)
+    base = {"avg": total_sec / (n * 3600), "busy_avg": busy_sec / (nb * 3600) if nb else 0,
+            "p99": percentile(hs, 99), "max": hs[-1]}
+
+    weekly = weekly_table(busy, hmax, busyset, h0, usable)
+
+    # 曜日×時間帯（直近 12 週）
+    cells_sum = [[0.0] * 24 for _ in range(7)]
+    cells_cnt = [[0] * 24 for _ in range(7)]
+    for k in range(max(0, n - 12 * 7 * 24), n):
+        hh = h0 + k
+        _, wd, _, _ = day_info(hh // 24)
+        cells_sum[wd][hh % 24] += avgc[k]
+        cells_cnt[wd][hh % 24] += 1
+    cells = [[cells_sum[w][h] / cells_cnt[w][h] if cells_cnt[w][h] else 0 for h in range(24)] for w in range(7)]
+
+    # --- ジョブ別 ---
+    stats = {}
+    for j in usable:
+        st = stats.get(j.key)
+        if st is None:
+            st = stats[j.key] = {"sec": 0.0, "busy": 0.0, "n": 0, "fail": 0, "durs": [],
+                                 "stage": Counter(), "months": defaultdict(float)}
+        d = j.e - j.s
+        st["sec"] += d
+        st["n"] += 1
+        st["durs"].append(d)
+        st["stage"][j.stage] += 1
+        if j.status == "failed":
+            st["fail"] += 1
+        st["months"][day_info(int(j.s // 86400))[3]] += d
+        s, e = j.s, j.e
+        for h in range(int(s // 3600), int(e // 3600) + 1):
+            if busyset[h - h0]:
+                ov = min(e, (h + 1) * 3600) - max(s, h * 3600)
+                if ov > 0:
+                    st["busy"] += ov
+    ranking = sorted(stats.items(), key=lambda kv: -kv[1]["busy"])
+
+    # --- 上位ジョブを 1 つずつ削った場合 ---
+    effects = []
+    for key, st in ranking[:a.effect_top]:
+        subset = [j for j in usable if j.key != key]
+        _, hm = concurrency(subset, h0, n, need_busy=False)
+        s = sorted(hm)
+        effects.append({"key": key, "busy_avg": (busy_sec - st["busy"]) / (nb * 3600) if nb else 0,
+                        "p99": percentile(s, 99), "max": s[-1], "saved_h": st["sec"] / 3600})
+
+    # --- what-if（--exclude）---
+    whatif = None
+    if a.exclude:
+        def hit(j):
+            return any(fnmatch.fnmatchcase(f"{j.project}:{j.name}", p) for p in a.exclude)
+        removed = [j for j in usable if hit(j)]
+        kept = [j for j in usable if not hit(j)]
+        b2, hm2 = concurrency(kept, h0, n)
+        s2 = sorted(hm2)
+        w2 = weekly_table(b2, hm2, None, h0, None)
+        whatif = {
+            "keys": sorted({f"{j.project}:{j.name}" for j in removed}),
+            "n_removed": len(removed),
+            "avg": sum(b2) / (n * 3600),
+            "busy_avg": sum(b for b, f in zip(b2, busyset) if f) / (nb * 3600) if nb else 0,
+            "p99": percentile(s2, 99), "max": s2[-1], "weekly": w2,
+            "saved_h": sum(j.e - j.s for j in removed) / 3600,
+        }
+
+    # ------------------------------------------------------------- CSV
+    os.makedirs(a.outdir, exist_ok=True)
+
+    def wcsv(name, headers, rows_):
+        with open(os.path.join(a.outdir, name), "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            w.writerows(rows_)
+
+    wcsv("weekly.csv", ["週(月曜)", "ジョブ数", "占有時間h", "平均同時実行", "最大同時実行",
+                        "混雑時間数", "待ちp50秒", "待ちp95秒"],
+         [[w["week"], w["jobs"], round(w["runner_h"], 2), round(w["avg_conc"], 3), w["peak_conc"],
+           w["busy_hours"], w["queued_p50_s"], w["queued_p95_s"]] for w in weekly])
+    wcsv("tags.csv", ["タグ", "ジョブ数", "占有時間h", "割合%", "プロジェクト数", "最大同時実行", "同時実行p99"],
+         [[r[0], r[1], round(r[2], 2), round(r[3], 2), r[4], r[5], r[6]] for r in tag_rows])
+    rank_rows = []
+    for (proj, name), st in ranking:
+        ds = sorted(st["durs"])
+        rank_rows.append([proj, name, st["stage"].most_common(1)[0][0], st["n"],
+                          round(st["sec"] / 3600, 2), round(st["sec"] / total_sec * 100, 2),
+                          round(st["busy"] / 3600, 2), round(st["busy"] / busy_sec * 100, 2) if busy_sec else 0,
+                          round(st["sec"] / st["n"] / 60, 2), round(percentile(ds, 95) / 60, 2),
+                          round(st["fail"] / st["n"] * 100, 1)])
+    wcsv("jobs_ranking.csv", ["プロジェクト", "ジョブ名", "ステージ", "回数", "占有時間h", "全体比%",
+                              "混雑時間帯h", "混雑時間帯比%", "平均分", "p95分", "failed率%"], rank_rows)
+    months = sorted({m for st in stats.values() for m in st["months"]})
+    top_total = sorted(stats.items(), key=lambda kv: -kv[1]["sec"])[:a.top]
+    wcsv("jobs_monthly.csv", ["プロジェクト", "ジョブ名"] + months,
+         [[p, nm] + [round(st["months"].get(m, 0) / 3600, 2) for m in months] for (p, nm), st in top_total])
+    if whatif:
+        wcsv("whatif_weekly.csv", ["週(月曜)", "占有時間h(現状)", "占有時間h(削減後)",
+                                   "平均同時実行(現状)", "平均同時実行(削減後)", "最大同時実行(現状)", "最大同時実行(削減後)"],
+             [[w["week"], round(w["runner_h"], 2), round(v["runner_h"], 2), round(w["avg_conc"], 3),
+               round(v["avg_conc"], 3), w["peak_conc"], v["peak_conc"]] for w, v in zip(weekly, whatif["weekly"])])
+
+    # ------------------------------------------------------------- HTML
+    labels = [datetime.fromisoformat(w["week"]).strftime("%y/%m/%d") for w in weekly]
+    first = (EPOCH + timedelta(days=h0 // 24)).isoformat()
+    last = (EPOCH + timedelta(days=(h0 + n - 1) // 24)).isoformat()
+    cap = a.capacity
+    H = [f"<!doctype html><html lang='ja'><head><meta charset='utf-8'>"
+         f"<meta name='viewport' content='width=device-width,initial-scale=1'><title>CI Runner 占有レポート</title>"
+         f"<style>{CSS}</style></head><body><main>",
+         "<h1>CI Runner 占有レポート</h1>",
+         f"<div class='sub'>{first} 〜 {last}（UTC{a.tz:+g}）"
+         f"{' / タグ: ' + html.escape(a.tags or '(タグなし)') if a.tags is not None else ''}</div>"]
+
+    kpis = [("集計対象ジョブ", f"{len(usable):,}"),
+            ("総占有時間", f"{fnum(total_sec / 3600)} h"),
+            ("平均同時実行数", fnum(base["avg"], 2)),
+            (f"混雑時間帯（上位{a.busy_pct:g}%）の平均", fnum(base["busy_avg"], 2)),
+            ("同時実行数 p99 / 最大", f"{base['p99']} / {base['max']}")]
+    if cap:
+        kpis.append(("平均稼働率", f"{base['avg'] / cap * 100:.1f}%"))
+        kpis.append(("混雑時間帯の稼働率", f"{base['busy_avg'] / cap * 100:.1f}%"))
+    H.append("<div class='kpi'>" + "".join(f"<div><span>{k}</span><b>{v}</b></div>" for k, v in kpis) + "</div>")
+    H.append(f"<p class='note'>未開始（skipped・manual など）{n_nostart:,} 件、取得時点で実行中 {n_running:,} 件は除外。"
+             f"占有時間はジョブが runner の枠を埋めていた時間で、CPU・メモリ使用量そのものではありません。"
+             f"{'' if cap else ' --capacity で runner 枠の合計を指定すると稼働率も表示します。'}</p>")
+
+    H.append("<h2>1. 週別の推移</h2>")
+    H.append(svg_line("週あたりの runner 占有時間", "時間/週", labels,
+                      [("現状", [w["runner_h"] for w in weekly], "#2563eb")]
+                      + ([("削減後", [w["runner_h"] for w in whatif["weekly"]], "#f59e0b")] if whatif else [])))
+    conc_series = [("最大", [w["peak_conc"] for w in weekly], "#dc2626"),
+                   ("平均", [w["avg_conc"] for w in weekly], "#2563eb")]
+    if cap:
+        conc_series.append(("枠", [cap] * len(weekly), "#9ca3af"))
+    H.append(svg_line("同時実行数", "ジョブ数", labels, conc_series))
+    H.append(svg_line("runner に拾われるまでの待ち時間", "秒",
+                      labels, [("p95", [w["queued_p95_s"] for w in weekly], "#dc2626"),
+                               ("p50", [w["queued_p50_s"] for w in weekly], "#2563eb")]))
+    H.append("<p class='note'>待ち時間 p95 が伸びている週は、枠が足りていない兆候です。週別の数値は weekly.csv。</p>")
+
+    H.append("<h2>2. 曜日 × 時間帯の平均同時実行数（直近 12 週）</h2>")
+    H.append(heatmap(cells))
+
+    H.append("<h2>3. タグ（runner プール）別</h2>")
+    H.append("<p class='note'>タグが違うジョブは別の runner で動くため、削減効果は同じプールの中でしか効きません。"
+             "プールごとに見る場合は --tags で絞ってください。</p>")
+    H.append(table(["タグ", "ジョブ数", "占有時間h", "割合", "プロジェクト数", "最大同時", "同時p99"],
+                   [[r[0], f"{r[1]:,}", fnum(r[2]), bar(r[3]), r[4], r[5] if r[5] is not None else "-",
+                     r[6] if r[6] is not None else "-"] for r in tag_rows[:15]]))
+
+    H.append(f"<h2>4. ジョブ別の占有（混雑時間帯の占有順・上位 {a.top}）</h2>")
+    H.append("<p class='note'>「混雑時間帯比」は、混雑している時間の runner 枠のうち、そのジョブが使っていた割合。"
+             "削ったときに混雑緩和に効くのはこちらが大きいジョブです。全件は jobs_ranking.csv。</p>")
+    H.append(table(["プロジェクト", "ジョブ名", "ステージ", "回数", "占有h", "全体比", "混雑時間帯比", "平均分", "p95分", "failed率"],
+                   [[r[0], r[1], r[2], f"{r[3]:,}", fnum(r[4]), f"{r[5]:.1f}%", bar(r[7]), fnum(r[8]), fnum(r[9]), f"{r[10]:.0f}%"]
+                    for r in rank_rows[:a.top]], num_from=3))
+
+    H.append(f"<h2>5. 上位ジョブを 1 つずつ削った場合</h2>")
+    H.append(table(["プロジェクト", "ジョブ名", "削減h/期間", "混雑時間帯の平均同時", "同時p99", "最大同時"],
+                   [["(現状)", "", "-", fnum(base["busy_avg"], 2), base["p99"], base["max"]]] +
+                   [[e["key"][0], e["key"][1], fnum(e["saved_h"]),
+                     f"{fnum(e['busy_avg'], 2)}（{e['busy_avg'] - base['busy_avg']:+.2f}）",
+                     f"{e['p99']}（{e['p99'] - base['p99']:+d}）", f"{e['max']}（{e['max'] - base['max']:+d}）"]
+                    for e in effects], num_from=2))
+    H.append("<p class='note'>そのジョブがなかったとして同時実行数を計算し直した値。後続ジョブが早く始まる・待ち時間が縮むといった"
+             "連鎖は再現していないので、待ち時間の改善は「混雑時間帯の平均同時実行数がどれだけ下がるか」で見てください。</p>")
+
+    if whatif:
+        H.append("<h2>6. 指定したジョブを削った場合（--exclude）</h2>")
+        H.append(f"<p class='note'>指定: {html.escape(' , '.join(a.exclude))} → 該当 {len(whatif['keys'])} 種類・{whatif['n_removed']:,} 件</p>")
+        rows6 = [["総占有時間h", fnum(total_sec / 3600), fnum(total_sec / 3600 - whatif["saved_h"])],
+                 ["平均同時実行数", fnum(base["avg"], 2), fnum(whatif["avg"], 2)],
+                 ["混雑時間帯の平均同時実行数", fnum(base["busy_avg"], 2), fnum(whatif["busy_avg"], 2)],
+                 ["同時実行数 p99", base["p99"], whatif["p99"]],
+                 ["最大同時実行数", base["max"], whatif["max"]]]
+        if cap:
+            rows6.append(["混雑時間帯の稼働率", f"{base['busy_avg'] / cap * 100:.1f}%", f"{whatif['busy_avg'] / cap * 100:.1f}%"])
+        H.append(table(["指標", "現状", "削減後"], rows6))
+        if whatif["keys"]:
+            H.append("<p class='note'>該当ジョブ: " + html.escape(", ".join(whatif["keys"][:50]))
+                     + (" …" if len(whatif["keys"]) > 50 else "") + "</p>")
+
+    H.append("</main></body></html>")
+    with open(os.path.join(a.outdir, "report.html"), "w", encoding="utf-8") as f:
+        f.write("".join(H))
+
+    # ------------------------------------------------------------- 画面には要点だけ
+    print(f"期間 {first} 〜 {last}  総占有 {total_sec / 3600:,.0f} h  平均同時 {base['avg']:.2f}  "
+          f"混雑時平均 {base['busy_avg']:.2f}  最大 {base['max']}")
+    if whatif:
+        print(f"削減後: 混雑時平均 {whatif['busy_avg']:.2f}  最大 {whatif['max']}  削減 {whatif['saved_h']:,.0f} h")
+    print(f"出力: {os.path.join(a.outdir, 'report.html')}")
+
+
+if __name__ == "__main__":
+    main()
