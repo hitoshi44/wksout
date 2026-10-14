@@ -336,11 +336,13 @@ def heatmap(cells):
     return "".join(h)
 
 
-def table(headers, rows, num_from=1):
+def table(headers, rows, num_from=1, center=()):
     """num_from 列目以降は数値（右寄せ）。横棒は左寄せ、文字列の列は長ければ折り返す。"""
     def cls(i, c):
         if isinstance(c, str) and c.startswith("<span class='barc'"):
             return "b"
+        if i in center:
+            return "c"
         return "n" if i >= num_from else "t"
 
     def body(c):
@@ -369,7 +371,7 @@ h1{font-size:1.5rem;margin:0 0 4px}h2{font-size:1.15rem;margin:36px 0 8px;border
 .chart{width:100%;height:auto;background:#fff;border:1px solid #e3e3e0;border-radius:8px;margin:8px 0}
 .chart .grid{stroke:#eee}.chart .ax{font-size:11px;fill:#666}.chart .ttl{font-size:13px;font-weight:600;fill:#1f2328}
 .tw{overflow-x:auto}table{border-collapse:collapse;font-size:.85rem;background:#fff}
-th,td{border:1px solid #e3e3e0;padding:3px 6px}td{white-space:nowrap}th{background:#f0f0ec;text-align:left;vertical-align:bottom;font-size:.78rem;line-height:1.35;min-width:4.4em;max-width:7.5em}td.t{white-space:normal;overflow-wrap:anywhere;max-width:16em}
+th,td{border:1px solid #e3e3e0;padding:3px 6px}td{white-space:nowrap}th{background:#f0f0ec;text-align:left;vertical-align:bottom;font-size:.78rem;line-height:1.35;min-width:4.4em;max-width:7.5em}td.c{text-align:center}td.t{white-space:normal;overflow-wrap:anywhere;max-width:16em}
 td.n{text-align:right}.heat td{text-align:center;font-size:.75rem;padding:3px 4px;min-width:26px}
 .barc{display:inline-flex;align-items:center;gap:4px}.bv{min-width:3.2em;text-align:right;font-variant-numeric:tabular-nums}
 .bar{display:inline-block;width:56px;height:8px;background:#eee;border-radius:4px;vertical-align:middle}
@@ -616,26 +618,21 @@ def main():
            w["busy_hours"], w["queued_p50_s"], w["queued_p95_s"]] for w in weekly])
     wcsv("tags.csv", ["タグ", "ジョブ数", "占有時間h", "割合%", "プロジェクト数", "最大同時実行", "同時実行p99"],
          [[r[0], r[1], round(r[2], 2), round(r[3], 2), r[4], r[5], r[6]] for r in tag_rows])
-    def main_proj(st):
-        """そのジョブを一番多く動かしているプロジェクト"""
-        pid, _ = st["projsec"].most_common(1)[0]
-        return plabel(pid)
-
     rank_rows = []
     for (_, name), st in ranking:
         ds = sorted(st["durs"])
-        rank_rows.append([name, main_proj(st), st["stage"].most_common(1)[0][0], len(st["projsec"]), st["n"],
+        rank_rows.append([name, st["stage"].most_common(1)[0][0], len(st["projsec"]), st["n"],
                           round(st["sec"] / 3600, 2), round(st["sec"] / total_sec * 100, 2),
                           round(st["busy"] / 3600, 2), round(st["busy"] / busy_sec * 100, 2) if busy_sec else 0,
                           round(st["sec"] / st["n"] / 60, 2), round(percentile(ds, 95) / 60, 2),
                           round(st["fail"] / st["n"] * 100, 1)])
-    wcsv("jobs_ranking.csv", ["ジョブ名", "主なプロジェクト", "ステージ", "プロジェクト数", "回数", "占有時間h",
+    wcsv("jobs_ranking.csv", ["ジョブ名", "ステージ", "プロジェクト数", "回数", "占有時間h",
                               "全時間帯に占める割合%", "混雑する時間帯の占有時間h", "混雑する時間帯に占める割合%",
                               "平均分", "p95分", "failed率%"], rank_rows)
     months = sorted({m for st in stats.values() for m in st["months"]})
     top_total = sorted(stats.items(), key=lambda kv: -kv[1]["sec"])[:a.top]
-    wcsv("jobs_monthly.csv", ["ジョブ名", "主なプロジェクト", "プロジェクト数"] + months,
-         [[nm, main_proj(st), len(st["projsec"])] + [round(st["months"].get(m, 0) / 3600, 2) for m in months]
+    wcsv("jobs_monthly.csv", ["ジョブ名", "プロジェクト数"] + months,
+         [[nm, len(st["projsec"])] + [round(st["months"].get(m, 0) / 3600, 2) for m in months]
           for (_, nm), st in top_total])
     pcols = ["プロジェクトID", "プロジェクト", "回数", "ジョブ種類", "占有時間h", "全時間帯に占める割合%", "混雑する時間帯に占める割合%",
              "平均同時実行", "混雑する時間帯の平均同時実行", "同時実行p99", "最大同時実行"]
@@ -722,14 +719,14 @@ def main():
         if cap:
             x += [f"{r['avg'] / cap * 100:.1f}%", f"{r['busy_avg'] / cap * 100:.1f}%"]
         prows_html.append(x)
-    H.append(table(ph, prows_html))
+    H.append(table(ph, prows_html, center={4}))
     H.append(footnote)
 
     H.append(f"<h2>5. ジョブ別の占有（混雑する時間帯に占める割合の順・上位 {a.top}）</h2>")
-    H.append(table(["ジョブ名", "主なプロジェクト", "ステージ", "プロジェクト数", "回数", "占有h", "全時間帯に占める割合",
+    H.append(table(["ジョブ名", "ステージ", "プロジェクト数", "回数", "占有h", "全時間帯に占める割合",
                     "混雑する時間帯※に占める割合", "平均分", "p95分", "failed率"],
-                   [[r[0], r[1], r[2], r[3], f"{r[4]:,}", fnum(r[5]), f"{r[6]:.1f}%", bar(r[8]), fnum(r[9]), fnum(r[10]),
-                     f"{r[11]:.0f}%"] for r in rank_rows[:a.top]], num_from=3))
+                   [[r[0], r[1], r[2], f"{r[3]:,}", fnum(r[4]), f"{r[5]:.1f}%", bar(r[7]), fnum(r[8]), fnum(r[9]),
+                     f"{r[10]:.0f}%"] for r in rank_rows[:a.top]], num_from=2, center={5}))
     H.append(footnote)
 
     if whatif:
