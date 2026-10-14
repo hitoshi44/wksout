@@ -11,12 +11,28 @@ GitLab CI ジョブ履歴（jobs_all.tsv）から runner の占有状況を集�
   python ci_usage.py --exclude "123:e2e-*" --exclude "*:nightly-*"
                                                           # 「プロジェクトID:ジョブ名」で削った場合を試算
 
+出力（--outdir、既定 report/）:
+  report.html        グラフと表のまとめ（ブラウザで開く）
+  weekly.csv         週別の占有時間・同時実行数・待ち時間
+  jobs_ranking.csv   ジョブ別の占有時間（混雑時間帯の占有順）
+  jobs_monthly.csv   上位ジョブの月別占有時間
+  projects.csv       プロジェクト別の占有時間・同時実行数（・稼働率）
+  projects_monthly.csv  プロジェクト別の月別占有時間
+  tags.csv           タグ（runner プール）別の占有時間
+  whatif_weekly.csv  --exclude を指定したときの週別比較
+
+考え方:
+  - 占有時間 = ジョブの started_at〜finished_at の合計（runner の枠を埋めていた時間）
+  - 同時実行数 = その時点で走っていたジョブ数
+  - 混雑時間帯 = 1 時間平均の同時実行数が全時間の上位 --busy-pct %（既定 10%）の時間
+  - CPU・メモリ使用量そのものではない点に注意
 """
 import argparse
 import csv
 import fnmatch
 import glob
 import html
+import json
 import math
 import os
 import re
@@ -205,7 +221,9 @@ def fnum(v, d=1):
     return f"{v:,.{d}f}"
 
 
-def svg_line(title, unit, labels, series, height=250):
+def svg_line(title, unit, labels, series, height=250, tips=None):
+    """折れ線グラフ。マウスを乗せると、その週の値をツールチップで表示する。
+    tips: ツールチップに出す見出し（labels と同じ長さ。省略時は labels）"""
     W, H, L, R, T, B = 920, height, 60, 16, 34, 42
     vals = [v for _, vs, _ in series for v in vs if v is not None]
     ymax = nice_ceil(max(vals) if vals else 1)
@@ -217,7 +235,15 @@ def svg_line(title, unit, labels, series, height=250):
     def y(v):
         return T + (H - T - B) * (1 - v / ymax)
 
-    p = [f'<svg viewBox="0 0 {W} {H}" class="chart" role="img" aria-label="{html.escape(title)}">',
+    data = {"xs": [round(x(i), 1) for i in range(n)], "top": T, "bottom": H - B,
+            "labels": tips or labels, "unit": unit,
+            "series": [{"name": nm, "color": c,
+                        "ys": [None if v is None else round(y(v), 1) for v in vs],
+                        "vals": ["-" if v is None else (f"{int(v):,}" if isinstance(v, int) or float(v).is_integer()
+                                                  else fnum(v, 2 if abs(v) < 10 else 1)) for v in vs]}
+                       for nm, vs, c in series]}
+    p = [f'<svg viewBox="0 0 {W} {H}" class="chart" role="img" aria-label="{html.escape(title)}" '
+         f'data-chart="{html.escape(json.dumps(data, ensure_ascii=False))}">',
          f'<text x="{L}" y="18" class="ttl">{html.escape(title)}</text>',
          f'<text x="{W - R}" y="18" class="ax" text-anchor="end">{html.escape(unit)}</text>']
     for g in range(5):
@@ -235,8 +261,64 @@ def svg_line(title, unit, labels, series, height=250):
         p.append(f'<rect x="{lx}" y="{H - 14}" width="12" height="4" fill="{color}"/>'
                  f'<text x="{lx + 16}" y="{H - 9}" class="ax">{html.escape(name)}</text>')
         lx += 30 + 13 * len(name)
+    # ホバー用（JS で動かす）
+    p.append(f'<line class="xh" x1="0" x2="0" y1="{T}" y2="{H - B}" visibility="hidden"/>')
+    for _, _, color in series:
+        p.append(f'<circle class="dot" r="4" fill="{color}" stroke="#fff" stroke-width="1.5" visibility="hidden"/>')
+    p.append(f'<rect class="hit" x="{L}" y="{T}" width="{W - L - R}" height="{H - T - B}" fill="transparent"/>')
     p.append("</svg>")
     return "".join(p)
+
+
+HOVER_JS = """
+(function () {
+  var tip = document.getElementById('tip');
+  document.querySelectorAll('svg.chart[data-chart]').forEach(function (svg) {
+    var d = JSON.parse(svg.getAttribute('data-chart'));
+    var xh = svg.querySelector('.xh');
+    var dots = svg.querySelectorAll('.dot');
+    var n = d.xs.length;
+    function hide() {
+      tip.style.display = 'none';
+      xh.setAttribute('visibility', 'hidden');
+      dots.forEach(function (c) { c.setAttribute('visibility', 'hidden'); });
+    }
+    svg.addEventListener('mousemove', function (ev) {
+      var pt = svg.createSVGPoint(); pt.x = ev.clientX; pt.y = ev.clientY;
+      var px = pt.matrixTransform(svg.getScreenCTM().inverse()).x;
+      var i = 0, best = Infinity;
+      for (var k = 0; k < n; k++) {
+        var dist = Math.abs(d.xs[k] - px);
+        if (dist < best) { best = dist; i = k; }
+      }
+      xh.setAttribute('x1', d.xs[i]); xh.setAttribute('x2', d.xs[i]);
+      xh.setAttribute('visibility', 'visible');
+      var rows = '';
+      d.series.forEach(function (s, k) {
+        var c = dots[k], y = s.ys[i];
+        if (y === null) { c.setAttribute('visibility', 'hidden'); }
+        else { c.setAttribute('cx', d.xs[i]); c.setAttribute('cy', y); c.setAttribute('visibility', 'visible'); }
+        rows += '<div><i style="background:' + s.color + '"></i>' + esc(s.name) +
+                '<b>' + s.vals[i] + '</b></div>';
+      });
+      tip.innerHTML = '<div class="th">' + esc(d.labels[i]) + '</div>' + rows +
+                      '<div class="tu">' + esc(d.unit) + '</div>';
+      tip.style.display = 'block';
+      var w = tip.offsetWidth, h = tip.offsetHeight;
+      var left = ev.clientX + 14, top = ev.clientY + 14;
+      if (left + w > window.innerWidth - 8) left = ev.clientX - w - 14;
+      if (top + h > window.innerHeight - 8) top = ev.clientY - h - 14;
+      tip.style.left = left + 'px'; tip.style.top = top + 'px';
+    });
+    svg.addEventListener('mouseleave', hide);
+  });
+  function esc(t) {
+    return String(t).replace(/[&<>"]/g, function (c) {
+      return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c];
+    });
+  }
+})();
+"""
 
 
 def heatmap(cells):
@@ -284,6 +366,12 @@ th,td{border:1px solid #e3e3e0;padding:4px 8px;white-space:nowrap}th{background:
 td.n{text-align:right}.heat td{text-align:center;font-size:.75rem;padding:3px 4px;min-width:26px}
 .bar{display:inline-block;width:80px;height:8px;background:#eee;border-radius:4px;vertical-align:middle}
 .bar span{display:block;height:100%;background:#2563eb;border-radius:4px}
+.chart .xh{stroke:#9ca3af;stroke-width:1;stroke-dasharray:3 3}
+#tip{position:fixed;display:none;pointer-events:none;z-index:10;background:#fff;border:1px solid #d4d4d0;
+ border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.12);padding:6px 10px;font-size:.8rem;min-width:150px}
+#tip .th{font-weight:600;margin-bottom:3px}#tip .tu{color:#888;font-size:.72rem;margin-top:2px}
+#tip div{display:flex;align-items:center;gap:6px}#tip i{width:10px;height:3px;display:inline-block}
+#tip b{margin-left:auto;padding-left:12px;font-variant-numeric:tabular-nums}
 """
 
 
@@ -571,6 +659,10 @@ def main():
 
     # ------------------------------------------------------------- HTML
     labels = [datetime.fromisoformat(w["week"]).strftime("%y/%m/%d") for w in weekly]
+    wtips = []
+    for w in weekly:
+        d0 = date.fromisoformat(w["week"])
+        wtips.append(f"{d0:%Y/%m/%d}（月）〜 {d0 + timedelta(days=6):%m/%d}（日）")
     first = (EPOCH + timedelta(days=h0 // 24)).isoformat()
     last = (EPOCH + timedelta(days=(h0 + n - 1) // 24)).isoformat()
     cap = a.capacity
@@ -590,30 +682,24 @@ def main():
         kpis.append(("平均稼働率", f"{base['avg'] / cap * 100:.1f}%"))
         kpis.append(("混雑時間帯の稼働率", f"{base['busy_avg'] / cap * 100:.1f}%"))
     H.append("<div class='kpi'>" + "".join(f"<div><span>{k}</span><b>{v}</b></div>" for k, v in kpis) + "</div>")
-    H.append(f"<p class='note'>未開始（skipped・manual など）{n_nostart:,} 件、取得時点で実行中 {n_running:,} 件は除外。"
-             f"占有時間はジョブが runner の枠を埋めていた時間で、CPU・メモリ使用量そのものではありません。"
-             f"{'' if cap else ' --capacity で runner 枠の合計を指定すると稼働率も表示します。'}</p>")
 
     H.append("<h2>1. 週別の推移</h2>")
     H.append(svg_line("週あたりの runner 占有時間", "時間/週", labels,
                       [("現状", [w["runner_h"] for w in weekly], "#2563eb")]
-                      + ([("削減後", [w["runner_h"] for w in whatif["weekly"]], "#f59e0b")] if whatif else [])))
+                      + ([("削減後", [w["runner_h"] for w in whatif["weekly"]], "#f59e0b")] if whatif else []), tips=wtips))
     conc_series = [("最大", [w["peak_conc"] for w in weekly], "#dc2626"),
                    ("平均", [w["avg_conc"] for w in weekly], "#2563eb")]
     if cap:
         conc_series.append(("枠", [cap] * len(weekly), "#9ca3af"))
-    H.append(svg_line("同時実行数", "ジョブ数", labels, conc_series))
+    H.append(svg_line("同時実行数", "ジョブ数", labels, conc_series, tips=wtips))
     H.append(svg_line("runner に拾われるまでの待ち時間", "秒",
                       labels, [("p95", [w["queued_p95_s"] for w in weekly], "#dc2626"),
-                               ("p50", [w["queued_p50_s"] for w in weekly], "#2563eb")]))
-    H.append("<p class='note'>待ち時間 p95 が伸びている週は、枠が足りていない兆候です。週別の数値は weekly.csv。</p>")
+                               ("p50", [w["queued_p50_s"] for w in weekly], "#2563eb")], tips=wtips))
 
     H.append("<h2>2. 曜日 × 時間帯の平均同時実行数（直近 12 週）</h2>")
     H.append(heatmap(cells))
 
     H.append("<h2>3. タグ（runner プール）別</h2>")
-    H.append("<p class='note'>タグが違うジョブは別の runner で動くため、削減効果は同じプールの中でしか効きません。"
-             "プールごとに見る場合は --tags で絞ってください。</p>")
     H.append(table(["タグ", "ジョブ数", "占有時間h", "割合", "プロジェクト数", "最大同時", "同時p99"],
                    [[r[0], f"{r[1]:,}", fnum(r[2]), bar(r[3]), r[4], r[5] if r[5] is not None else "-",
                      r[6] if r[6] is not None else "-"] for r in tag_rows[:15]]))
@@ -622,13 +708,7 @@ def main():
     ptop = proj_rows[:a.project_top]
     palette = ["#2563eb", "#dc2626", "#16a34a", "#f59e0b", "#7c3aed"]
     H.append(svg_line("上位 5 プロジェクトの週あたり占有時間", "時間/週", labels,
-                      [(r["name"][-24:], r["weekly"], palette[i]) for i, r in enumerate(ptop[:5])]))
-    if cap:
-        H.append("<p class='note'>稼働率 = そのプロジェクトのジョブが runner 枠（--capacity）のうち平均で何割を使っていたか。"
-                 "「混雑時」は混雑時間帯だけで見た値。</p>")
-    else:
-        H.append("<p class='note'>「平均同時」はそのプロジェクトのジョブが平均で何本並んで走っていたか（= 使っていた runner 枠の平均）。"
-                 "--capacity を指定すると稼働率（%）に換算します。全件は projects.csv、月別は projects_monthly.csv。</p>")
+                      [(r["name"][-24:], r["weekly"], palette[i]) for i, r in enumerate(ptop[:5])], tips=wtips))
     ph = ["プロジェクト", "回数", "ジョブ種類", "占有h", "全体比", "混雑時間帯比", "平均同時", "混雑時の平均同時", "同時p99", "最大同時"]
     if cap:
         ph += ["稼働率", "混雑時の稼働率"]
@@ -642,10 +722,6 @@ def main():
     H.append(table(ph, prows_html))
 
     H.append(f"<h2>5. ジョブ別の占有（混雑時間帯の占有順・上位 {a.top}）</h2>")
-    H.append("<p class='note'>「混雑時間帯比」は、混雑している時間の runner 枠のうち、そのジョブが使っていた割合。"
-             "削ったときに混雑緩和に効くのはこちらが大きいジョブです。"
-             + ("同じジョブ名はプロジェクトをまたいで合算し、プロジェクト列には該当プロジェクト数を表示しています。" if a.group_by == "name" else "")
-             + "全件は jobs_ranking.csv。</p>")
     H.append(table(["プロジェクト", "ジョブ名", "ステージ", "回数", "占有h", "全体比", "混雑時間帯比", "平均分", "p95分", "failed率"],
                    [[r[0], r[1], r[2], f"{r[3]:,}", fnum(r[4]), f"{r[5]:.1f}%", bar(r[7]), fnum(r[8]), fnum(r[9]), f"{r[10]:.0f}%"]
                     for r in rank_rows[:a.top]], num_from=3))
@@ -657,8 +733,6 @@ def main():
                      f"{fnum(e['busy_avg'], 2)}（{e['busy_avg'] - base['busy_avg']:+.2f}）",
                      f"{e['p99']}（{e['p99'] - base['p99']:+d}）", f"{e['max']}（{e['max'] - base['max']:+d}）"]
                     for e in effects], num_from=2))
-    H.append("<p class='note'>そのジョブがなかったとして同時実行数を計算し直した値。後続ジョブが早く始まる・待ち時間が縮むといった"
-             "連鎖は再現していないので、待ち時間の改善は「混雑時間帯の平均同時実行数がどれだけ下がるか」で見てください。</p>")
 
     if whatif:
         H.append("<h2>7. 指定したジョブを削った場合（--exclude）</h2>")
@@ -675,7 +749,7 @@ def main():
             H.append("<p class='note'>該当ジョブ: " + html.escape(", ".join(whatif["keys"][:50]))
                      + (" …" if len(whatif["keys"]) > 50 else "") + "</p>")
 
-    H.append("</main></body></html>")
+    H.append(f"</main><div id='tip'></div><script>{HOVER_JS}</script></body></html>")
     with open(os.path.join(a.outdir, "report.html"), "w", encoding="utf-8") as f:
         f.write("".join(H))
 
