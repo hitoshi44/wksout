@@ -337,11 +337,17 @@ def heatmap(cells):
 
 
 def table(headers, rows, num_from=1):
+    """num_from 列目以降は数値（右寄せ）。横棒は左寄せ、文字列の列は長ければ折り返す。"""
+    def cls(i, c):
+        if isinstance(c, str) and c.startswith("<span class='barc'"):
+            return "b"
+        return "n" if i >= num_from else "t"
+
+    def body(c):
+        return c if isinstance(c, str) and c.startswith("<") else html.escape(str(c))
     h = ["<div class='tw'><table><tr>" + "".join(f"<th>{html.escape(x)}</th>" for x in headers) + "</tr>"]
     for r in rows:
-        h.append("<tr>" + "".join(
-            f"<td class='{'n' if i >= num_from and not (isinstance(c, str) and c.startswith('<span class=' + chr(39) + 'barc')) else ''}'>{c if isinstance(c, str) and c.startswith('<') else html.escape(str(c))}</td>"
-            for i, c in enumerate(r)) + "</tr>")
+        h.append("<tr>" + "".join(f"<td class='{cls(i, c)}'>{body(c)}</td>" for i, c in enumerate(r)) + "</tr>")
     h.append("</table></div>")
     return "".join(h)
 
@@ -354,7 +360,7 @@ def bar(pct):
 CSS = """
 body{font-family:system-ui,-apple-system,"Segoe UI","Hiragino Sans","Yu Gothic UI",sans-serif;
  margin:0;background:#f7f7f5;color:#1f2328;line-height:1.6}
-main{max-width:980px;margin:0 auto;padding:24px 16px 64px}
+main{max-width:1180px;margin:0 auto;padding:24px 16px 64px}
 h1{font-size:1.5rem;margin:0 0 4px}h2{font-size:1.15rem;margin:36px 0 8px;border-bottom:1px solid #ddd;padding-bottom:4px}
 .sub{color:#666;font-size:.9rem}.note{color:#555;font-size:.85rem}
 .kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin:16px 0}
@@ -363,10 +369,10 @@ h1{font-size:1.5rem;margin:0 0 4px}h2{font-size:1.15rem;margin:36px 0 8px;border
 .chart{width:100%;height:auto;background:#fff;border:1px solid #e3e3e0;border-radius:8px;margin:8px 0}
 .chart .grid{stroke:#eee}.chart .ax{font-size:11px;fill:#666}.chart .ttl{font-size:13px;font-weight:600;fill:#1f2328}
 .tw{overflow-x:auto}table{border-collapse:collapse;font-size:.85rem;background:#fff}
-th,td{border:1px solid #e3e3e0;padding:4px 8px;white-space:nowrap}th{background:#f0f0ec;text-align:left}
+th,td{border:1px solid #e3e3e0;padding:3px 6px}td{white-space:nowrap}th{background:#f0f0ec;text-align:left;vertical-align:bottom;font-size:.78rem;line-height:1.35;min-width:4.4em;max-width:7.5em}td.t{white-space:normal;overflow-wrap:anywhere;max-width:16em}
 td.n{text-align:right}.heat td{text-align:center;font-size:.75rem;padding:3px 4px;min-width:26px}
-.barc{display:inline-flex;align-items:center;gap:6px}.bv{min-width:3.6em;text-align:right;font-variant-numeric:tabular-nums}
-.bar{display:inline-block;width:80px;height:8px;background:#eee;border-radius:4px;vertical-align:middle}
+.barc{display:inline-flex;align-items:center;gap:4px}.bv{min-width:3.2em;text-align:right;font-variant-numeric:tabular-nums}
+.bar{display:inline-block;width:56px;height:8px;background:#eee;border-radius:4px;vertical-align:middle}
 .bar span{display:block;height:100%;background:#2563eb;border-radius:4px}
 .chart .xh{stroke:#9ca3af;stroke-width:1;stroke-dasharray:3 3}
 .fn{color:#666;font-size:.78rem;margin:4px 0 0}
