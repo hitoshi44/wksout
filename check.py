@@ -372,7 +372,7 @@ h1{font-size:1.5rem;margin:0 0 4px}h2{font-size:1.15rem;margin:36px 0 8px;border
 .chart .grid{stroke:#eee}.chart .ax{font-size:11px;fill:#666}.chart .ttl{font-size:13px;font-weight:600;fill:#1f2328}
 .tw{overflow-x:auto}table{border-collapse:collapse;font-size:.85rem;background:#fff}
 th,td{border:1px solid #e3e3e0;padding:3px 6px}td{white-space:nowrap}th{background:#f0f0ec;text-align:left;vertical-align:bottom;font-size:.78rem;line-height:1.35;min-width:4.4em;max-width:7.5em}td.c{text-align:center}td.t{white-space:normal;overflow-wrap:anywhere;max-width:16em}
-td.n{text-align:right}.heat td{text-align:center;font-size:.75rem;padding:3px 4px;min-width:26px}
+td.n{text-align:right}.heat{width:100%;table-layout:fixed}.heat th,.heat td{min-width:0;max-width:none;padding:3px 0;text-align:center;font-size:.72rem;white-space:nowrap}.heat th:first-child{width:4.2em}
 .barc{display:inline-flex;align-items:center;gap:4px}.bv{min-width:3.2em;text-align:right;font-variant-numeric:tabular-nums}
 .bar{display:inline-block;width:56px;height:8px;background:#eee;border-radius:4px;vertical-align:middle}
 .bar span{display:block;height:100%;background:#2563eb;border-radius:4px}
