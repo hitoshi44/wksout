@@ -19,6 +19,7 @@ GitLab CI ジョブ履歴（jobs_all.tsv）から runner の占有状況を集�
   projects.csv       プロジェクト別の占有時間・同時実行数（・稼働率）
   projects_monthly.csv  プロジェクト別の月別占有時間
   tags.csv           タグ（runner プール）別の占有時間
+  wait_by_project.csv  待ち時間の長いジョブのプロジェクト内訳
   whatif_weekly.csv  --exclude を指定したときの週別比較
 
 考え方:
@@ -151,6 +152,24 @@ def concurrency(jobs, h0, n, need_busy=True):
     return busy, hmax
 
 
+def time_at_limit(jobs, limit, h0, n):
+    """同時実行数が limit 以上だった時間（秒）を 1 時間ごとに返す。"""
+    sec = [0.0] * n
+    ev = sorted([(j.s, 1) for j in jobs] + [(j.e, -1) for j in jobs])
+    cur, prev = 0, None
+    for t, d in ev:
+        if prev is not None and cur >= limit and t > prev:
+            x = prev
+            while x < t:
+                h = int(x // 3600)
+                y = min(t, (h + 1) * 3600)
+                sec[h - h0] += y - x
+                x = y
+        cur += d
+        prev = t
+    return sec
+
+
 _day_cache = {}
 
 
@@ -226,7 +245,12 @@ def svg_line(title, unit, labels, series, height=250, tips=None):
     tips: ツールチップに出す見出し（labels と同じ長さ。省略時は labels）"""
     W, H, L, R, T, B = 920, height, 60, 16, 34, 42
     vals = [v for _, vs, _ in series for v in vs if v is not None]
-    ymax = nice_ceil(max(vals) if vals else 1)
+    vmax = max(vals) if vals and max(vals) > 0 else 1
+    # 目盛り間隔は 1・2・5 の系列から、目盛りが 6 本以内になる最小のもの
+    e = 10 ** math.floor(math.log10(vmax)) / 10
+    step = next(m * e * 10 ** k for k in range(3) for m in (1, 2, 5) if math.ceil(vmax / (m * e * 10 ** k)) <= 6)
+    ticks = max(2, math.ceil(vmax / step))
+    ymax = step * ticks
     n = len(labels)
 
     def x(i):
@@ -246,11 +270,11 @@ def svg_line(title, unit, labels, series, height=250, tips=None):
          f'data-chart="{html.escape(json.dumps(data, ensure_ascii=False))}">',
          f'<text x="{L}" y="18" class="ttl">{html.escape(title)}</text>',
          f'<text x="{W - R}" y="18" class="ax" text-anchor="end">{html.escape(unit)}</text>']
-    for g in range(5):
-        v = ymax * g / 4
+    for g in range(ticks + 1):
+        v = step * g
         yy = y(v)
         p.append(f'<line x1="{L}" x2="{W - R}" y1="{yy:.1f}" y2="{yy:.1f}" class="grid"/>')
-        p.append(f'<text x="{L - 6}" y="{yy + 4:.1f}" class="ax" text-anchor="end">{fnum(v)}</text>')
+        p.append(f'<text x="{L - 6}" y="{yy + 4:.1f}" class="ax" text-anchor="end">{f"{v:,.0f}" if float(step).is_integer() else f"{v:g}"}</text>')
     step = max(1, math.ceil(n / 10))
     for i in range(0, n, step):
         p.append(f'<text x="{x(i):.1f}" y="{H - B + 18}" class="ax" text-anchor="middle">{html.escape(labels[i])}</text>')
@@ -404,6 +428,8 @@ def main():
                     help="ジョブ別集計の単位。name=ジョブ名でプロジェクトをまたいで合算（既定）、project=プロジェクト+ジョブ名")
     ap.add_argument("--names", default="projects.tsv",
                     help="プロジェクト ID と名前の対応表（ID<TAB>名前）。あれば ID の代わりに名前を表示（既定 projects.tsv）")
+    ap.add_argument("--wait-weeks", type=int, default=13,
+                    help="待ち時間のプロジェクト内訳を見る期間（直近の週数、既定 13 ≒ 3 か月。0 で全期間）")
     ap.add_argument("--project-top", type=int, default=10, help="プロジェクト別の表示件数（既定 10）")
     ap.add_argument("--merge-parallel", action="store_true",
                     help="parallel / matrix で分かれたジョブ（'rspec 1/4'、'test: [a, b]'）を 1 つにまとめる")
@@ -450,8 +476,18 @@ def main():
                     pname[c[0].strip()] = c[1].strip()
         print(f"プロジェクト名: {a.names} から {len(pname)} 件")
 
+    # 表示名はパスの最後（例: group/sub/web-app → web-app）。同じ名前が複数あるときだけ 1 つ上の階層も付ける
+    short = {pid: path.split("/")[-1] for pid, path in pname.items()}
+    for depth in range(2, 10):
+        dup = Counter(short.values())
+        if all(c == 1 for c in dup.values()):
+            break
+        for pid, path in pname.items():
+            if dup[short[pid]] > 1:
+                short[pid] = "/".join(path.split("/")[-depth:])
+
     def plabel(pid):
-        return pname.get(pid, pid)
+        return short.get(pid, pid)
 
     # ジョブの集計単位
     par_re = re.compile(r"( \d+/\d+|: \[.*\])$")   # parallel の " 1/4"、matrix の ": [a, b]"
@@ -508,6 +544,40 @@ def main():
             "p99": percentile(hs, 99), "max": hs[-1]}
 
     weekly = weekly_table(busy, hmax, busyset, h0, usable)
+    week_idx = {w["week"]: i for i, w in enumerate(weekly)}
+
+    # 同時実行数が上限に達していた時間（上限 = --capacity、なければ期間中の最大値）
+    limit = int(a.capacity) if a.capacity else base["max"]
+    at_lim = time_at_limit(usable, limit, h0, n)
+    for w in weekly:
+        w["limit_min"] = 0.0
+    for k in range(n):
+        if at_lim[k]:
+            _, _, wk, _ = day_info((h0 + k) // 24)
+            weekly[week_idx[(EPOCH + timedelta(days=wk)).isoformat()]]["limit_min"] += at_lim[k] / 60
+
+    # --- 待ち時間の長いジョブのプロジェクト内訳（直近 --wait-weeks 週）---
+    wait_from = (h0 + n) * 3600 - a.wait_weeks * 7 * 86400 if a.wait_weeks else -math.inf
+    wjobs = [j for j in usable if j.s >= wait_from and j.queued is not None]
+    wq = sorted(j.queued for j in wjobs)
+    wait_thr = percentile(wq, 95) or 0
+    wstat = defaultdict(lambda: {"n": 0, "long": 0, "q": []})
+    for j in wjobs:
+        ws = wstat[j.project]
+        ws["n"] += 1
+        ws["q"].append(j.queued)
+        if j.queued > wait_thr:
+            ws["long"] += 1
+    n_long = sum(ws["long"] for ws in wstat.values())
+    wait_rows = []
+    for pid, ws in sorted(wstat.items(), key=lambda kv: -kv[1]["long"]):
+        q = sorted(ws["q"])
+        wait_rows.append({"pid": pid, "name": plabel(pid), "n": ws["n"], "long": ws["long"],
+                          "p50": percentile(q, 50), "p95": percentile(q, 95),
+                          "long_share": ws["long"] / n_long * 100 if n_long else 0,
+                          "job_share": ws["n"] / len(wjobs) * 100 if wjobs else 0})
+    wait_period = (f"{(EPOCH + timedelta(days=int(max(wait_from, h0 * 3600) // 86400))):%Y/%m/%d} 〜 "
+                   f"{(EPOCH + timedelta(days=(h0 + n - 1) // 24)):%Y/%m/%d}")
 
     # 曜日×時間帯（直近 12 週）
     cells_sum = [[0.0] * 24 for _ in range(7)]
@@ -545,7 +615,6 @@ def main():
     ranking = sorted(stats.items(), key=lambda kv: -kv[1]["busy"])
 
     # --- プロジェクト別 ---
-    week_idx = {w["week"]: i for i, w in enumerate(weekly)}
     pstats = {}
     for j in usable:
         ps = pstats.get(j.project)
@@ -613,9 +682,13 @@ def main():
             w.writerows(rows_)
 
     wcsv("weekly.csv", ["週(月曜)", "ジョブ数", "占有時間h", "平均同時実行", "最大同時実行",
-                        "混雑する時間帯の時間数", "待ちp50秒", "待ちp95秒"],
+                        "混雑する時間帯の時間数", "待ちp50秒", "待ちp95秒", f"同時実行{limit}以上の時間(分)"],
          [[w["week"], w["jobs"], round(w["runner_h"], 2), round(w["avg_conc"], 3), w["peak_conc"],
-           w["busy_hours"], w["queued_p50_s"], w["queued_p95_s"]] for w in weekly])
+           w["busy_hours"], w["queued_p50_s"], w["queued_p95_s"], round(w["limit_min"], 1)] for w in weekly])
+    wcsv("wait_by_project.csv", ["プロジェクトID", "プロジェクト", "ジョブ数", "待ちp50秒", "待ちp95秒",
+                                 f"長い待ち(>{wait_thr:.0f}秒)の件数", "長い待ちに占める割合%", "全ジョブに占める割合%"],
+         [[r["pid"], r["name"], r["n"], r["p50"], r["p95"], r["long"], round(r["long_share"], 2),
+           round(r["job_share"], 2)] for r in wait_rows])
     wcsv("tags.csv", ["タグ", "ジョブ数", "占有時間h", "割合%", "プロジェクト数", "最大同時実行", "同時実行p99"],
          [[r[0], r[1], round(r[2], 2), round(r[3], 2), r[4], r[5], r[6]] for r in tag_rows])
     rank_rows = []
@@ -695,16 +768,27 @@ def main():
     H.append(svg_line("runner に拾われるまでの待ち時間", "秒",
                       labels, [("p95", [w["queued_p95_s"] for w in weekly], "#dc2626"),
                                ("p50", [w["queued_p50_s"] for w in weekly], "#2563eb")], tips=wtips))
+    H.append(svg_line(f"同時実行数が上限（{limit}）に達していた時間", "分/週", labels,
+                      [("上限到達", [w["limit_min"] for w in weekly], "#dc2626")], tips=wtips))
+    if not cap:
+        H.append(f"<p class='fn'>※上限：--capacity の指定がないため、期間中の最大同時実行数（{limit}）を上限とみなしています</p>")
 
-    H.append("<h2>2. 曜日 × 時刻の平均同時実行数（直近 12 週）</h2>")
+    H.append(f"<h2>2. 待ち時間の長いジョブのプロジェクト内訳（{wait_period}）</h2>")
+    H.append(table(["プロジェクト", "ジョブ数", "待ち p50（秒）", "待ち p95（秒）", "長い待ち※の件数",
+                    "長い待ち※に占める割合", "全ジョブに占める割合"],
+                   [[r["name"], f"{r['n']:,}", fnum(r["p50"]), fnum(r["p95"]), f"{r['long']:,}", bar(r["long_share"]),
+                     f"{r['job_share']:.1f}%"] for r in wait_rows[:a.project_top]], center={6}))
+    H.append(f"<p class='fn'>※長い待ち：この期間の全ジョブの待ち時間 p95（{wait_thr:.0f} 秒）を超えたもの</p>")
+
+    H.append("<h2>3. 曜日 × 時刻の平均同時実行数（直近 12 週）</h2>")
     H.append(heatmap(cells))
 
-    H.append("<h2>3. タグ（runner プール）別</h2>")
+    H.append("<h2>4. タグ（runner プール）別</h2>")
     H.append(table(["タグ", "ジョブ数", "占有時間h", "割合", "プロジェクト数", "最大同時", "同時p99"],
                    [[r[0], f"{r[1]:,}", fnum(r[2]), bar(r[3]), r[4], r[5] if r[5] is not None else "-",
                      r[6] if r[6] is not None else "-"] for r in tag_rows[:15]]))
 
-    H.append(f"<h2>4. プロジェクト別（混雑する時間帯に占める割合の順・上位 {a.project_top}）</h2>")
+    H.append(f"<h2>5. プロジェクト別（混雑する時間帯に占める割合の順・上位 {a.project_top}）</h2>")
     ptop = proj_rows[:a.project_top]
     palette = ["#2563eb", "#dc2626", "#16a34a", "#f59e0b", "#7c3aed"]
     H.append(svg_line("上位 5 プロジェクトの週あたり占有時間", "時間/週", labels,
@@ -722,7 +806,7 @@ def main():
     H.append(table(ph, prows_html, center={4}))
     H.append(footnote)
 
-    H.append(f"<h2>5. ジョブ別の占有（混雑する時間帯に占める割合の順・上位 {a.top}）</h2>")
+    H.append(f"<h2>6. ジョブ別の占有（混雑する時間帯に占める割合の順・上位 {a.top}）</h2>")
     H.append(table(["ジョブ名", "ステージ", "プロジェクト数", "回数", "占有h", "全時間帯に占める割合",
                     "混雑する時間帯※に占める割合", "平均分", "p95分", "failed率"],
                    [[r[0], r[1], r[2], f"{r[3]:,}", fnum(r[4]), f"{r[5]:.1f}%", bar(r[7]), fnum(r[8]), fnum(r[9]),
@@ -730,7 +814,7 @@ def main():
     H.append(footnote)
 
     if whatif:
-        H.append("<h2>6. 指定したジョブを削った場合（--exclude）</h2>")
+        H.append("<h2>7. 指定したジョブを削った場合（--exclude）</h2>")
         H.append(f"<p class='note'>指定: {html.escape(' , '.join(a.exclude))} → 該当 {len(whatif['keys'])} 種類・{whatif['n_removed']:,} 件</p>")
         rows6 = [["総占有時間h", fnum(total_sec / 3600), fnum(total_sec / 3600 - whatif["saved_h"])],
                  ["平均同時実行数", fnum(base["avg"], 2), fnum(whatif["avg"], 2)],
