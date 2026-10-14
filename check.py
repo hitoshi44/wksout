@@ -523,9 +523,8 @@ def main():
         k = keyfn(j)
         st = stats.get(k)
         if st is None:
-            st = stats[k] = {"sec": 0.0, "busy": 0.0, "n": 0, "fail": 0, "durs": [], "projs": set(),
+            st = stats[k] = {"sec": 0.0, "busy": 0.0, "n": 0, "fail": 0, "durs": [], "projsec": Counter(),
                              "stage": Counter(), "months": defaultdict(float)}
-        st["projs"].add(j.project)
         d = j.e - j.s
         st["sec"] += d
         st["n"] += 1
@@ -533,6 +532,7 @@ def main():
         st["stage"][j.stage] += 1
         if j.status == "failed":
             st["fail"] += 1
+        st["projsec"][j.project] += j.e - j.s
         st["months"][day_info(int(j.s // 86400))[3]] += d
         s, e = j.s, j.e
         for h in range(int(s // 3600), int(e // 3600) + 1):
@@ -616,26 +616,27 @@ def main():
            w["busy_hours"], w["queued_p50_s"], w["queued_p95_s"]] for w in weekly])
     wcsv("tags.csv", ["タグ", "ジョブ数", "占有時間h", "割合%", "プロジェクト数", "最大同時実行", "同時実行p99"],
          [[r[0], r[1], round(r[2], 2), round(r[3], 2), r[4], r[5], r[6]] for r in tag_rows])
-    rank_rows = []
-    def proj_label(proj, st):
-        if proj:
-            return plabel(proj)
-        return plabel(next(iter(st["projs"]))) if len(st["projs"]) == 1 else f"{len(st['projs'])}件"
+    def main_proj(st):
+        """そのジョブを一番多く動かしているプロジェクト"""
+        pid, _ = st["projsec"].most_common(1)[0]
+        return plabel(pid)
 
-    for (proj, name), st in ranking:
-        proj = proj_label(proj, st)
+    rank_rows = []
+    for (_, name), st in ranking:
         ds = sorted(st["durs"])
-        rank_rows.append([proj, name, st["stage"].most_common(1)[0][0], st["n"],
+        rank_rows.append([name, main_proj(st), st["stage"].most_common(1)[0][0], len(st["projsec"]), st["n"],
                           round(st["sec"] / 3600, 2), round(st["sec"] / total_sec * 100, 2),
                           round(st["busy"] / 3600, 2), round(st["busy"] / busy_sec * 100, 2) if busy_sec else 0,
                           round(st["sec"] / st["n"] / 60, 2), round(percentile(ds, 95) / 60, 2),
                           round(st["fail"] / st["n"] * 100, 1)])
-    wcsv("jobs_ranking.csv", ["プロジェクト", "ジョブ名", "ステージ", "回数", "占有時間h", "全時間帯に占める割合%",
-                              "混雑する時間帯の占有時間h", "混雑する時間帯に占める割合%", "平均分", "p95分", "failed率%"], rank_rows)
+    wcsv("jobs_ranking.csv", ["ジョブ名", "主なプロジェクト", "ステージ", "プロジェクト数", "回数", "占有時間h",
+                              "全時間帯に占める割合%", "混雑する時間帯の占有時間h", "混雑する時間帯に占める割合%",
+                              "平均分", "p95分", "failed率%"], rank_rows)
     months = sorted({m for st in stats.values() for m in st["months"]})
     top_total = sorted(stats.items(), key=lambda kv: -kv[1]["sec"])[:a.top]
-    wcsv("jobs_monthly.csv", ["プロジェクト", "ジョブ名"] + months,
-         [[proj_label(p, st), nm] + [round(st["months"].get(m, 0) / 3600, 2) for m in months] for (p, nm), st in top_total])
+    wcsv("jobs_monthly.csv", ["ジョブ名", "主なプロジェクト", "プロジェクト数"] + months,
+         [[nm, main_proj(st), len(st["projsec"])] + [round(st["months"].get(m, 0) / 3600, 2) for m in months]
+          for (_, nm), st in top_total])
     pcols = ["プロジェクトID", "プロジェクト", "回数", "ジョブ種類", "占有時間h", "全時間帯に占める割合%", "混雑する時間帯に占める割合%",
              "平均同時実行", "混雑する時間帯の平均同時実行", "同時実行p99", "最大同時実行"]
     if a.capacity:
@@ -725,9 +726,10 @@ def main():
     H.append(footnote)
 
     H.append(f"<h2>5. ジョブ別の占有（混雑する時間帯に占める割合の順・上位 {a.top}）</h2>")
-    H.append(table(["プロジェクト", "ジョブ名", "ステージ", "回数", "占有h", "全時間帯に占める割合", "混雑する時間帯※に占める割合", "平均分", "p95分", "failed率"],
-                   [[r[0], r[1], r[2], f"{r[3]:,}", fnum(r[4]), f"{r[5]:.1f}%", bar(r[7]), fnum(r[8]), fnum(r[9]), f"{r[10]:.0f}%"]
-                    for r in rank_rows[:a.top]], num_from=3))
+    H.append(table(["ジョブ名", "主なプロジェクト", "ステージ", "プロジェクト数", "回数", "占有h", "全時間帯に占める割合",
+                    "混雑する時間帯※に占める割合", "平均分", "p95分", "failed率"],
+                   [[r[0], r[1], r[2], r[3], f"{r[4]:,}", fnum(r[5]), f"{r[6]:.1f}%", bar(r[8]), fnum(r[9]), fnum(r[10]),
+                     f"{r[11]:.0f}%"] for r in rank_rows[:a.top]], num_from=3))
     H.append(footnote)
 
     if whatif:
