@@ -324,7 +324,7 @@ HOVER_JS = """
 def heatmap(cells):
     """cells[wd][hour] = 平均同時実行数"""
     mx = max((v for row in cells for v in row), default=0) or 1
-    h = ['<table class="heat"><tr><th></th>' + "".join(f"<th>{i}</th>" for i in range(24)) + "</tr>"]
+    h = ['<table class="heat"><tr><th>曜日＼時</th>' + "".join(f"<th>{i}時</th>" for i in range(24)) + "</tr>"]
     for wd in range(7):
         h.append(f"<tr><th>{WEEKDAYS[wd]}</th>")
         for v in cells[wd]:
@@ -387,7 +387,6 @@ def main():
                     help="削る想定のジョブ 'プロジェクトID:ジョブ名'（glob 可、複数指定可）")
     ap.add_argument("--busy-pct", type=float, default=10, help="混雑時間帯とみなす上位 %%（既定 10）")
     ap.add_argument("--top", type=int, default=30, help="ランキングの表示件数（既定 30）")
-    ap.add_argument("--effect-top", type=int, default=10, help="個別に削減効果を計算する件数（既定 10）")
     ap.add_argument("--since", help="この日以降に開始したジョブだけ集計（例: 2025-06-01）")
     ap.add_argument("--until", help="この日より前に開始したジョブだけ集計（例: 2026-10-01）")
     ap.add_argument("--group-by", choices=["name", "project"], default="name",
@@ -574,15 +573,6 @@ def main():
                           "avg": avg, "busy_avg": busy_avg, "p99": p99, "peak": peak,
                           "weekly": ps["weekly"], "months": ps["months"]})
 
-    # --- 上位ジョブを 1 つずつ削った場合 ---
-    effects = []
-    for key, st in ranking[:a.effect_top]:
-        subset = [j for j in usable if keyfn(j) != key]
-        _, hm = concurrency(subset, h0, n, need_busy=False)
-        s = sorted(hm)
-        effects.append({"key": (plabel(key[0]) if key[0] else (plabel(next(iter(st["projs"]))) if len(st["projs"]) == 1 else f"{len(st['projs'])}件"), key[1]), "busy_avg": (busy_sec - st["busy"]) / (nb * 3600) if nb else 0,
-                        "p99": percentile(s, 99), "max": s[-1], "saved_h": st["sec"] / 3600})
-
     # --- what-if（--exclude）---
     whatif = None
     if a.exclude:
@@ -696,7 +686,7 @@ def main():
                       labels, [("p95", [w["queued_p95_s"] for w in weekly], "#dc2626"),
                                ("p50", [w["queued_p50_s"] for w in weekly], "#2563eb")], tips=wtips))
 
-    H.append("<h2>2. 曜日 × 時間帯の平均同時実行数（直近 12 週）</h2>")
+    H.append("<h2>2. 曜日 × 時刻の平均同時実行数（直近 12 週）</h2>")
     H.append(heatmap(cells))
 
     H.append("<h2>3. タグ（runner プール）別</h2>")
@@ -726,16 +716,8 @@ def main():
                    [[r[0], r[1], r[2], f"{r[3]:,}", fnum(r[4]), f"{r[5]:.1f}%", bar(r[7]), fnum(r[8]), fnum(r[9]), f"{r[10]:.0f}%"]
                     for r in rank_rows[:a.top]], num_from=3))
 
-    H.append(f"<h2>6. 上位ジョブを 1 つずつ削った場合</h2>")
-    H.append(table(["プロジェクト", "ジョブ名", "削減h/期間", "混雑時間帯の平均同時", "同時p99", "最大同時"],
-                   [["(現状)", "", "-", fnum(base["busy_avg"], 2), base["p99"], base["max"]]] +
-                   [[e["key"][0], e["key"][1], fnum(e["saved_h"]),
-                     f"{fnum(e['busy_avg'], 2)}（{e['busy_avg'] - base['busy_avg']:+.2f}）",
-                     f"{e['p99']}（{e['p99'] - base['p99']:+d}）", f"{e['max']}（{e['max'] - base['max']:+d}）"]
-                    for e in effects], num_from=2))
-
     if whatif:
-        H.append("<h2>7. 指定したジョブを削った場合（--exclude）</h2>")
+        H.append("<h2>6. 指定したジョブを削った場合（--exclude）</h2>")
         H.append(f"<p class='note'>指定: {html.escape(' , '.join(a.exclude))} → 該当 {len(whatif['keys'])} 種類・{whatif['n_removed']:,} 件</p>")
         rows6 = [["総占有時間h", fnum(total_sec / 3600), fnum(total_sec / 3600 - whatif["saved_h"])],
                  ["平均同時実行数", fnum(base["avg"], 2), fnum(whatif["avg"], 2)],
