@@ -4,11 +4,11 @@
 GitLab CI ジョブ履歴（jobs_all.tsv）から runner の占有状況を集計する。
 標準ライブラリのみ（Python 3.11 以上）。
 
-使い方:
-  python ci_usage.py jobs_all.tsv
-  python ci_usage.py jobs_all.tsv --capacity 8            # runner 枠の合計が分かる場合
-  python ci_usage.py jobs_all.tsv --tags "*docker*"       # タグ（runner プール）で絞る
-  python ci_usage.py jobs_all.tsv --exclude "123:e2e-*" --exclude "*:nightly-*"
+使い方（jobs_YYYY-MM-DD.tsv が並んでいるフォルダで実行）:
+  python ci_usage.py                                      # jobs_*.tsv をすべて読む
+  python ci_usage.py --capacity 8                         # runner 枠の合計が分かる場合
+  python ci_usage.py --tags "*docker*"                    # タグ（runner プール）で絞る
+  python ci_usage.py --exclude "123:e2e-*" --exclude "*:nightly-*"
                                                           # 「プロジェクトID:ジョブ名」で削った場合を試算
 
 出力（--outdir、既定 report/）:
@@ -18,16 +18,11 @@ GitLab CI ジョブ履歴（jobs_all.tsv）から runner の占有状況を集�
   jobs_monthly.csv   上位ジョブの月別占有時間
   tags.csv           タグ（runner プール）別の占有時間
   whatif_weekly.csv  --exclude を指定したときの週別比較
-
-考え方:
-  - 占有時間 = ジョブの started_at〜finished_at の合計（runner の枠を埋めていた時間）
-  - 同時実行数 = その時点で走っていたジョブ数
-  - 混雑時間帯 = 1 時間平均の同時実行数が全時間の上位 --busy-pct %（既定 10%）の時間
-  - CPU・メモリ使用量そのものではない点に注意
 """
 import argparse
 import csv
 import fnmatch
+import glob
 import html
 import math
 import os
@@ -67,13 +62,29 @@ def to_float(s):
         return None
 
 
-def load(path, tzoff):
-    """job_id で重複除去しながら読む。時刻はすべて「ローカル時刻の秒」に変換する。"""
+def expand_inputs(patterns):
+    """jobs_*.tsv のようなパターンを Python 側で展開する（cmd / PowerShell でも動くように）。"""
+    files = []
+    for p in patterns:
+        hit = sorted(glob.glob(p)) if any(c in p for c in "*?[") else [p]
+        files += [f for f in hit if f not in files and os.path.isfile(f)]
+    return files
+
+
+def load(paths, tzoff):
+    """複数ファイルを job_id で重複除去しながら読む。時刻はすべて「ローカル時刻の秒」に変換する。"""
     best = {}
+    rows = 0
+    for path in paths:
+        rows += _load_one(path, tzoff, best)
+    return rows, list(best.values())
+
+
+def _load_one(path, tzoff, best):
     rows = 0
     with open(path, encoding="utf-8", errors="replace", newline="") as f:
         for row in csv.reader(f, delimiter="\t", quoting=csv.QUOTE_NONE):
-            if not row or row[0] == "project":   # sort -u でヘッダが途中に混ざっても飛ばす
+            if not row or row[0] == "project":   # 各ファイルのヘッダ行は飛ばす
                 continue
             if len(row) < len(COLS):
                 row = row + [""] * (len(COLS) - len(row))
@@ -94,7 +105,7 @@ def load(path, tzoff):
             # 同じジョブが複数期間に出たら、終了しているほうを採用
             if old is None or (old.e is None and j.e is not None):
                 best[jid] = j
-    return rows, list(best.values())
+    return rows
 
 
 # ------------------------------------------------------------------ 計算
@@ -289,7 +300,8 @@ td.n{text-align:right}.heat td{text-align:center;font-size:.75rem;padding:3px 4p
 # ------------------------------------------------------------------ メイン
 def main():
     ap = argparse.ArgumentParser(description="GitLab CI ジョブ履歴の runner 占有集計")
-    ap.add_argument("input", nargs="?", default="jobs_all.tsv")
+    ap.add_argument("inputs", nargs="*", default=["jobs_*.tsv"],
+                    help="入力ファイル（既定: カレントの jobs_*.tsv をすべて）")
     ap.add_argument("--tz", type=float, default=9, help="表示タイムゾーンの UTC からの時差（既定 9）")
     ap.add_argument("--capacity", type=float, help="runner の同時実行枠の合計（分かれば稼働率を出す）")
     ap.add_argument("--tags", help="タグで絞る（glob、例: '*docker*'。タグなしは ''）")
@@ -306,7 +318,11 @@ def main():
         pass
 
     tzoff = a.tz * 3600
-    rows, alljobs = load(a.input, tzoff)
+    files = expand_inputs(a.inputs)
+    if not files:
+        sys.exit(f"入力ファイルが見つかりません: {' '.join(a.inputs)}")
+    print(f"入力: {len(files)} ファイル（{os.path.basename(files[0])} 〜 {os.path.basename(files[-1])}）")
+    rows, alljobs = load(files, tzoff)
     usable = [j for j in alljobs if j.s is not None and j.e is not None and j.e > j.s]
     n_nostart = sum(1 for j in alljobs if j.s is None)
     n_running = sum(1 for j in alljobs if j.s is not None and j.e is None)
