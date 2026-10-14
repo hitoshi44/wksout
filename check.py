@@ -14,7 +14,7 @@ GitLab CI ジョブ履歴（jobs_all.tsv）から runner の占有状況を集�
 出力（--outdir、既定 report/）:
   report.html        グラフと表のまとめ（ブラウザで開く）
   weekly.csv         週別の占有時間・同時実行数・待ち時間
-  jobs_ranking.csv   ジョブ別の占有時間（混雑時間帯の占有順）
+  jobs_ranking.csv   ジョブ別の占有時間（混雑する時間帯に占める割合の順）
   jobs_monthly.csv   上位ジョブの月別占有時間
   projects.csv       プロジェクト別の占有時間・同時実行数（・稼働率）
   projects_monthly.csv  プロジェクト別の月別占有時間
@@ -24,7 +24,7 @@ GitLab CI ジョブ履歴（jobs_all.tsv）から runner の占有状況を集�
 考え方:
   - 占有時間 = ジョブの started_at〜finished_at の合計（runner の枠を埋めていた時間）
   - 同時実行数 = その時点で走っていたジョブ数
-  - 混雑時間帯 = 1 時間平均の同時実行数が全時間の上位 --busy-pct %（既定 10%）の時間
+  - 混雑する時間帯 = 1 時間平均の同時実行数が全時間の上位 --busy-pct %（既定 10%）の時間
   - CPU・メモリ使用量そのものではない点に注意
 """
 import argparse
@@ -367,6 +367,7 @@ td.n{text-align:right}.heat td{text-align:center;font-size:.75rem;padding:3px 4p
 .bar{display:inline-block;width:80px;height:8px;background:#eee;border-radius:4px;vertical-align:middle}
 .bar span{display:block;height:100%;background:#2563eb;border-radius:4px}
 .chart .xh{stroke:#9ca3af;stroke-width:1;stroke-dasharray:3 3}
+.fn{color:#666;font-size:.78rem;margin:4px 0 0}
 #tip{position:fixed;display:none;pointer-events:none;z-index:10;background:#fff;border:1px solid #d4d4d0;
  border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.12);padding:6px 10px;font-size:.8rem;min-width:150px}
 #tip .th{font-weight:600;margin-bottom:3px}#tip .tu{color:#888;font-size:.72rem;margin-top:2px}
@@ -385,7 +386,7 @@ def main():
     ap.add_argument("--tags", help="タグで絞る（glob、例: '*docker*'。タグなしは ''）")
     ap.add_argument("--exclude", action="append", default=[],
                     help="削る想定のジョブ 'プロジェクトID:ジョブ名'（glob 可、複数指定可）")
-    ap.add_argument("--busy-pct", type=float, default=10, help="混雑時間帯とみなす上位 %%（既定 10）")
+    ap.add_argument("--busy-pct", type=float, default=10, help="混雑する時間帯とみなす上位 %%（既定 10）")
     ap.add_argument("--top", type=int, default=30, help="ランキングの表示件数（既定 30）")
     ap.add_argument("--since", help="この日以降に開始したジョブだけ集計（例: 2025-06-01）")
     ap.add_argument("--until", help="この日より前に開始したジョブだけ集計（例: 2026-10-01）")
@@ -602,7 +603,7 @@ def main():
             w.writerows(rows_)
 
     wcsv("weekly.csv", ["週(月曜)", "ジョブ数", "占有時間h", "平均同時実行", "最大同時実行",
-                        "混雑時間数", "待ちp50秒", "待ちp95秒"],
+                        "混雑する時間帯の時間数", "待ちp50秒", "待ちp95秒"],
          [[w["week"], w["jobs"], round(w["runner_h"], 2), round(w["avg_conc"], 3), w["peak_conc"],
            w["busy_hours"], w["queued_p50_s"], w["queued_p95_s"]] for w in weekly])
     wcsv("tags.csv", ["タグ", "ジョブ数", "占有時間h", "割合%", "プロジェクト数", "最大同時実行", "同時実行p99"],
@@ -621,16 +622,16 @@ def main():
                           round(st["busy"] / 3600, 2), round(st["busy"] / busy_sec * 100, 2) if busy_sec else 0,
                           round(st["sec"] / st["n"] / 60, 2), round(percentile(ds, 95) / 60, 2),
                           round(st["fail"] / st["n"] * 100, 1)])
-    wcsv("jobs_ranking.csv", ["プロジェクト", "ジョブ名", "ステージ", "回数", "占有時間h", "全体比%",
-                              "混雑時間帯h", "混雑時間帯比%", "平均分", "p95分", "failed率%"], rank_rows)
+    wcsv("jobs_ranking.csv", ["プロジェクト", "ジョブ名", "ステージ", "回数", "占有時間h", "全時間帯に占める割合%",
+                              "混雑する時間帯の占有時間h", "混雑する時間帯に占める割合%", "平均分", "p95分", "failed率%"], rank_rows)
     months = sorted({m for st in stats.values() for m in st["months"]})
     top_total = sorted(stats.items(), key=lambda kv: -kv[1]["sec"])[:a.top]
     wcsv("jobs_monthly.csv", ["プロジェクト", "ジョブ名"] + months,
          [[proj_label(p, st), nm] + [round(st["months"].get(m, 0) / 3600, 2) for m in months] for (p, nm), st in top_total])
-    pcols = ["プロジェクトID", "プロジェクト", "回数", "ジョブ種類", "占有時間h", "全体比%", "混雑時間帯比%",
-             "平均同時実行", "混雑時間帯の平均同時実行", "同時実行p99", "最大同時実行"]
+    pcols = ["プロジェクトID", "プロジェクト", "回数", "ジョブ種類", "占有時間h", "全時間帯に占める割合%", "混雑する時間帯に占める割合%",
+             "平均同時実行", "混雑する時間帯の平均同時実行", "同時実行p99", "最大同時実行"]
     if a.capacity:
-        pcols += ["平均稼働率%", "混雑時間帯の稼働率%"]
+        pcols += ["平均稼働率%", "混雑する時間帯の稼働率%"]
     prow = []
     for r in proj_rows:
         x = [r["pid"], r["name"], r["n"], r["jobs"], round(r["hours"], 2), round(r["share"], 2),
@@ -656,6 +657,8 @@ def main():
     first = (EPOCH + timedelta(days=h0 // 24)).isoformat()
     last = (EPOCH + timedelta(days=(h0 + n - 1) // 24)).isoformat()
     cap = a.capacity
+    footnote = (f"<p class='fn'>※混雑する時間帯：1 時間ごとの runner 稼働（平均同時実行数）が多い時間のうち、"
+                f"上位 {a.busy_pct:g}% の時間</p>")
     H = [f"<!doctype html><html lang='ja'><head><meta charset='utf-8'>"
          f"<meta name='viewport' content='width=device-width,initial-scale=1'><title>CI Runner 占有レポート</title>"
          f"<style>{CSS}</style></head><body><main>",
@@ -666,12 +669,13 @@ def main():
     kpis = [("集計対象ジョブ", f"{len(usable):,}"),
             ("総占有時間", f"{fnum(total_sec / 3600)} h"),
             ("平均同時実行数", fnum(base["avg"], 2)),
-            (f"混雑時間帯（上位{a.busy_pct:g}%）の平均", fnum(base["busy_avg"], 2)),
+            ("混雑する時間帯※の平均同時実行数", fnum(base["busy_avg"], 2)),
             ("同時実行数 p99 / 最大", f"{base['p99']} / {base['max']}")]
     if cap:
         kpis.append(("平均稼働率", f"{base['avg'] / cap * 100:.1f}%"))
-        kpis.append(("混雑時間帯の稼働率", f"{base['busy_avg'] / cap * 100:.1f}%"))
+        kpis.append(("混雑する時間帯※の稼働率", f"{base['busy_avg'] / cap * 100:.1f}%"))
     H.append("<div class='kpi'>" + "".join(f"<div><span>{k}</span><b>{v}</b></div>" for k, v in kpis) + "</div>")
+    H.append(footnote)
 
     H.append("<h2>1. 週別の推移</h2>")
     H.append(svg_line("週あたりの runner 占有時間", "時間/週", labels,
@@ -694,14 +698,14 @@ def main():
                    [[r[0], f"{r[1]:,}", fnum(r[2]), bar(r[3]), r[4], r[5] if r[5] is not None else "-",
                      r[6] if r[6] is not None else "-"] for r in tag_rows[:15]]))
 
-    H.append(f"<h2>4. プロジェクト別（混雑時間帯の占有順・上位 {a.project_top}）</h2>")
+    H.append(f"<h2>4. プロジェクト別（混雑する時間帯に占める割合の順・上位 {a.project_top}）</h2>")
     ptop = proj_rows[:a.project_top]
     palette = ["#2563eb", "#dc2626", "#16a34a", "#f59e0b", "#7c3aed"]
     H.append(svg_line("上位 5 プロジェクトの週あたり占有時間", "時間/週", labels,
                       [(r["name"][-24:], r["weekly"], palette[i]) for i, r in enumerate(ptop[:5])], tips=wtips))
-    ph = ["プロジェクト", "回数", "ジョブ種類", "占有h", "全体比", "混雑時間帯比", "平均同時", "混雑時の平均同時", "同時p99", "最大同時"]
+    ph = ["プロジェクト", "回数", "ジョブ種類", "占有h", "全時間帯に占める割合", "混雑する時間帯※に占める割合", "平均同時", "混雑する時間帯※の平均同時", "同時p99", "最大同時"]
     if cap:
-        ph += ["稼働率", "混雑時の稼働率"]
+        ph += ["稼働率", "混雑する時間帯※の稼働率"]
     prows_html = []
     for r in ptop:
         x = [r["name"], f"{r['n']:,}", r["jobs"], fnum(r["hours"]), f"{r['share']:.1f}%", bar(r["busy_share"]),
@@ -710,23 +714,26 @@ def main():
             x += [f"{r['avg'] / cap * 100:.1f}%", f"{r['busy_avg'] / cap * 100:.1f}%"]
         prows_html.append(x)
     H.append(table(ph, prows_html))
+    H.append(footnote)
 
-    H.append(f"<h2>5. ジョブ別の占有（混雑時間帯の占有順・上位 {a.top}）</h2>")
-    H.append(table(["プロジェクト", "ジョブ名", "ステージ", "回数", "占有h", "全体比", "混雑時間帯比", "平均分", "p95分", "failed率"],
+    H.append(f"<h2>5. ジョブ別の占有（混雑する時間帯に占める割合の順・上位 {a.top}）</h2>")
+    H.append(table(["プロジェクト", "ジョブ名", "ステージ", "回数", "占有h", "全時間帯に占める割合", "混雑する時間帯※に占める割合", "平均分", "p95分", "failed率"],
                    [[r[0], r[1], r[2], f"{r[3]:,}", fnum(r[4]), f"{r[5]:.1f}%", bar(r[7]), fnum(r[8]), fnum(r[9]), f"{r[10]:.0f}%"]
                     for r in rank_rows[:a.top]], num_from=3))
+    H.append(footnote)
 
     if whatif:
         H.append("<h2>6. 指定したジョブを削った場合（--exclude）</h2>")
         H.append(f"<p class='note'>指定: {html.escape(' , '.join(a.exclude))} → 該当 {len(whatif['keys'])} 種類・{whatif['n_removed']:,} 件</p>")
         rows6 = [["総占有時間h", fnum(total_sec / 3600), fnum(total_sec / 3600 - whatif["saved_h"])],
                  ["平均同時実行数", fnum(base["avg"], 2), fnum(whatif["avg"], 2)],
-                 ["混雑時間帯の平均同時実行数", fnum(base["busy_avg"], 2), fnum(whatif["busy_avg"], 2)],
+                 ["混雑する時間帯※の平均同時実行数", fnum(base["busy_avg"], 2), fnum(whatif["busy_avg"], 2)],
                  ["同時実行数 p99", base["p99"], whatif["p99"]],
                  ["最大同時実行数", base["max"], whatif["max"]]]
         if cap:
-            rows6.append(["混雑時間帯の稼働率", f"{base['busy_avg'] / cap * 100:.1f}%", f"{whatif['busy_avg'] / cap * 100:.1f}%"])
+            rows6.append(["混雑する時間帯※の稼働率", f"{base['busy_avg'] / cap * 100:.1f}%", f"{whatif['busy_avg'] / cap * 100:.1f}%"])
         H.append(table(["指標", "現状", "削減後"], rows6))
+        H.append(footnote)
         if whatif["keys"]:
             H.append("<p class='note'>該当ジョブ: " + html.escape(", ".join(whatif["keys"][:50]))
                      + (" …" if len(whatif["keys"]) > 50 else "") + "</p>")
@@ -737,9 +744,9 @@ def main():
 
     # ------------------------------------------------------------- 画面には要点だけ
     print(f"期間 {first} 〜 {last}  総占有 {total_sec / 3600:,.0f} h  平均同時 {base['avg']:.2f}  "
-          f"混雑時平均 {base['busy_avg']:.2f}  最大 {base['max']}")
+          f"混雑する時間帯の平均同時 {base['busy_avg']:.2f}  最大 {base['max']}")
     if whatif:
-        print(f"削減後: 混雑時平均 {whatif['busy_avg']:.2f}  最大 {whatif['max']}  削減 {whatif['saved_h']:,.0f} h")
+        print(f"削減後: 混雑する時間帯の平均同時 {whatif['busy_avg']:.2f}  最大 {whatif['max']}  削減 {whatif['saved_h']:,.0f} h")
     print(f"出力: {os.path.join(a.outdir, 'report.html')}")
 
 
