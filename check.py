@@ -340,14 +340,15 @@ def table(headers, rows, num_from=1):
     h = ["<div class='tw'><table><tr>" + "".join(f"<th>{html.escape(x)}</th>" for x in headers) + "</tr>"]
     for r in rows:
         h.append("<tr>" + "".join(
-            f"<td class='{'n' if i >= num_from else ''}'>{c if isinstance(c, str) and c.startswith('<') else html.escape(str(c))}</td>"
+            f"<td class='{'n' if i >= num_from and not (isinstance(c, str) and c.startswith('<span class=' + chr(39) + 'barc')) else ''}'>{c if isinstance(c, str) and c.startswith('<') else html.escape(str(c))}</td>"
             for i, c in enumerate(r)) + "</tr>")
     h.append("</table></div>")
     return "".join(h)
 
 
 def bar(pct):
-    return f"<span class='bar'><span style='width:{min(100, pct):.1f}%'></span></span> {pct:.1f}%"
+    return (f"<span class='barc'><span class='bar'><span style='width:{min(100, pct):.1f}%'></span></span>"
+            f"<span class='bv'>{pct:.1f}%</span></span>")
 
 
 CSS = """
@@ -364,6 +365,7 @@ h1{font-size:1.5rem;margin:0 0 4px}h2{font-size:1.15rem;margin:36px 0 8px;border
 .tw{overflow-x:auto}table{border-collapse:collapse;font-size:.85rem;background:#fff}
 th,td{border:1px solid #e3e3e0;padding:4px 8px;white-space:nowrap}th{background:#f0f0ec;text-align:left}
 td.n{text-align:right}.heat td{text-align:center;font-size:.75rem;padding:3px 4px;min-width:26px}
+.barc{display:inline-flex;align-items:center;gap:6px}.bv{min-width:3.6em;text-align:right;font-variant-numeric:tabular-nums}
 .bar{display:inline-block;width:80px;height:8px;background:#eee;border-radius:4px;vertical-align:middle}
 .bar span{display:block;height:100%;background:#2563eb;border-radius:4px}
 .chart .xh{stroke:#9ca3af;stroke-width:1;stroke-dasharray:3 3}
