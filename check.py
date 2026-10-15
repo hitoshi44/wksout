@@ -10,6 +10,7 @@ GitLab CI ジョブ履歴（jobs_all.tsv）から runner の占有状況を集�
   python ci_usage.py --tags "*docker*"                    # タグ（runner プール）で絞る
   python ci_usage.py --exclude "123:e2e-*" --exclude "*:nightly-*"
                                                           # 「プロジェクトID:ジョブ名」で削った場合を試算
+  python ci_usage.py --pool-re "-[0-9a-z]+-[0-9a-z]{5}$"  # runner 名から除く部分を自分で指定
 
 出力（--outdir、既定 report/）:
   report.html        グラフと表のまとめ（ブラウザで開く）
@@ -18,7 +19,12 @@ GitLab CI ジョブ履歴（jobs_all.tsv）から runner の占有状況を集�
   jobs_monthly.csv   上位ジョブの月別占有時間
   projects.csv       プロジェクト別の占有時間・同時実行数（・稼働率）
   projects_monthly.csv  プロジェクト別の月別占有時間
-  tags.csv           タグ（runner プール）別の占有時間
+  tags.csv           タグ別の占有時間
+  pools.csv          runner プール（runner 名からハッシュを除いたもの）別の占有・上限・待ち時間
+  pool_weekly.csv    プール別の週ごとの最大同時実行数・待ち時間 p95
+  pool_map.csv       runner 名・runner ID → プールの対応（ハッシュの除き方の確認用）
+  pool_over_limit.csv  プールの上限の目安を超えた時間と、そのとき動いていた runner ID
+  team_pool.csv      チーム（プロジェクトのサブグループ）× プールの使用割合
   wait_by_project.csv  待ち時間の長いジョブのプロジェクト内訳
   whatif_weekly.csv  --exclude を指定したときの週別比較
 
@@ -26,6 +32,8 @@ GitLab CI ジョブ履歴（jobs_all.tsv）から runner の占有状況を集�
   - 占有時間 = ジョブの started_at〜finished_at の合計（runner の枠を埋めていた時間）
   - 同時実行数 = その時点で走っていたジョブ数
   - 混雑する時間帯 = 1 時間平均の同時実行数が全時間の上位 --busy-pct %（既定 10%）の時間
+  - プール = runner 名の末尾のハッシュ（Pod 名の ReplicaSet ハッシュ・ランダム文字列など）を除いたもの。
+    runner が登録し直されて名前や ID が変わっても、同じプールとしてまとめる
   - CPU・メモリ使用量そのものではない点に注意
 """
 import argparse
@@ -45,12 +53,14 @@ COLS = ["project", "pipeline_id", "job_id", "name", "stage", "status", "duration
         "queued_duration", "created_at", "started_at", "finished_at", "runner_id",
         "runner", "tags"]
 EPOCH = date(1970, 1, 1)
+EPOCH_DT = datetime(1970, 1, 1)
 WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
 
 
 # ------------------------------------------------------------------ 読み込み
 class Job:
-    __slots__ = ("jid", "project", "name", "stage", "status", "s", "e", "queued", "tags", "runner")
+    __slots__ = ("jid", "project", "name", "stage", "status", "s", "e", "queued", "tags",
+                 "runner_id", "runner", "pool")
 
 
 def parse_ts(s):
@@ -108,16 +118,54 @@ def _load_one(path, tzoff, best):
             j.e = e + tzoff if e is not None else None
             j.queued = to_float(r["queued_duration"])
             j.tags = r["tags"]
-            rid, rdesc = r["runner_id"].strip(), r["runner"].strip()
-            if rid:
-                j.runner = f"{rdesc} (#{rid})" if rdesc else f"#{rid}"
-            else:
-                j.runner = "(不明)"          # 削除済み runner など
+            j.runner_id = r["runner_id"].strip()
+            j.runner = r["runner"].strip()
+            j.pool = ""
             old = best.get(jid)
             # 同じジョブが複数期間に出たら、終了しているほうを採用
             if old is None or (old.e is None and j.e is not None):
                 best[jid] = j
     return rows
+
+
+# ------------------------------------------------------------------ runner プール
+_SEG_RE = re.compile(r"[-_. ]([0-9A-Za-z]{5,})$")
+_K8S_RAND = re.compile(r"[bcdfghjklmnpqrstvwxz2456789]{5,10}")   # Pod 名のランダム部分に使われる文字
+
+
+def _looks_like_hash(seg):
+    if _K8S_RAND.fullmatch(seg):
+        return True
+    if re.fullmatch(r"[0-9a-fA-F]{8,}", seg):
+        return True
+    if re.fullmatch(r"[A-Za-z]+\d{1,3}", seg):        # team1、runner01 のような名前は残す
+        return False
+    # 英字と数字が入り混じった 8 文字以上（トークン・ランダム ID など）
+    return len(seg) >= 8 and len(re.findall(r"\d", seg)) >= 2 and len(re.findall(r"[A-Za-z]", seg)) >= 2
+
+
+def make_pool_fn(pool_re):
+    """runner 名 → プール名。pool_re があればその部分を消す。なければ末尾のハッシュらしい部分を最大 3 つ消す。"""
+    if pool_re:
+        rx = re.compile(pool_re)
+
+        def fn(name):
+            if not name:
+                return "(runner 不明)"
+            return rx.sub("", name).strip() or name
+        return fn
+
+    def fn(name):
+        if not name:
+            return "(runner 不明)"
+        s = name.strip()
+        for _ in range(3):
+            m = _SEG_RE.search(s)
+            if not m or not _looks_like_hash(m.group(1)):
+                break
+            s = s[:m.start()]
+        return s or name
+    return fn
 
 
 # ------------------------------------------------------------------ 計算
@@ -283,24 +331,28 @@ def svg_line(title, unit, labels, series, height=250, tips=None):
     step = max(1, math.ceil(n / 10))
     for i in range(0, n, step):
         p.append(f'<text x="{x(i):.1f}" y="{H - B + 18}" class="ax" text-anchor="middle">{html.escape(labels[i])}</text>')
-    def tw(t):   # 凡例文字のおおよその幅（px）
-        return sum(6.5 if ord(ch) < 128 else 11 for ch in t)
-    pos, lx, row = [], L, 0
-    for name, _, _ in series:
-        w = 16 + tw(name) + 18
-        if lx + w > W - R and lx > L:
-            lx, row = L, row + 1
-        pos.append((lx, row))
-        lx += w
-    extra = row * 16
-    for (name, vs, color), (px, prow) in zip(series, pos):
-        pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(vs) if v is not None)
-        p.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2"/>')
-        ly = H - 14 + prow * 16
-        p.append(f'<rect x="{px}" y="{ly}" width="12" height="4" fill="{color}"/>'
-                 f'<text x="{px + 16}" y="{ly + 5}" class="ax">{html.escape(name)}</text>')
-    if extra:
-        p[0] = p[0].replace(f'viewBox="0 0 {W} {H}"', f'viewBox="0 0 {W} {H + extra}"', 1)
+    lx = L
+    for name, vs, color in series:
+        # None で線を切る（データのない週をまたいで線を引かない）
+        segs, cur = [], []
+        for i, v in enumerate(vs):
+            if v is None:
+                if cur:
+                    segs.append(cur)
+                cur = []
+            else:
+                cur.append(f"{x(i):.1f},{y(v):.1f}")
+        if cur:
+            segs.append(cur)
+        for sg in segs:
+            if len(sg) == 1:
+                cx, cy = sg[0].split(",")
+                p.append(f'<circle cx="{cx}" cy="{cy}" r="2" fill="{color}"/>')
+            else:
+                p.append(f'<polyline points="{" ".join(sg)}" fill="none" stroke="{color}" stroke-width="2"/>')
+        p.append(f'<rect x="{lx}" y="{H - 14}" width="12" height="4" fill="{color}"/>'
+                 f'<text x="{lx + 16}" y="{H - 9}" class="ax">{html.escape(name)}</text>')
+        lx += 30 + 13 * len(name)
     # ホバー用（JS で動かす）
     p.append(f'<line class="xh" x1="0" x2="0" y1="{T}" y2="{H - B}" visibility="hidden"/>')
     for _, _, color in series:
@@ -381,8 +433,6 @@ def table(headers, rows, num_from=1, center=()):
     def cls(i, c):
         if isinstance(c, str) and c.startswith("<span class='barc'"):
             return "b"
-        if isinstance(c, str) and c.startswith("<span>"):
-            return "w"
         if i in center:
             return "c"
         return "n" if i >= num_from else "t"
@@ -405,7 +455,8 @@ CSS = """
 body{font-family:system-ui,-apple-system,"Segoe UI","Hiragino Sans","Yu Gothic UI",sans-serif;
  margin:0;background:#f7f7f5;color:#1f2328;line-height:1.6}
 main{max-width:1180px;margin:0 auto;padding:24px 16px 64px}
-h1{font-size:1.5rem;margin:0 0 4px}h3{font-size:.95rem;margin:20px 0 6px}h2{font-size:1.15rem;margin:36px 0 8px;border-bottom:1px solid #ddd;padding-bottom:4px}
+h1{font-size:1.5rem;margin:0 0 4px}h2{font-size:1.15rem;margin:36px 0 8px;border-bottom:1px solid #ddd;padding-bottom:4px}
+h3{font-size:1rem;margin:20px 0 6px}
 .sub{color:#666;font-size:.9rem}.note{color:#555;font-size:.85rem}
 .kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin:16px 0}
 .kpi div{background:#fff;border:1px solid #e3e3e0;border-radius:8px;padding:10px 12px}
@@ -413,7 +464,7 @@ h1{font-size:1.5rem;margin:0 0 4px}h3{font-size:.95rem;margin:20px 0 6px}h2{font
 .chart{width:100%;height:auto;background:#fff;border:1px solid #e3e3e0;border-radius:8px;margin:8px 0}
 .chart .grid{stroke:#eee}.chart .ax{font-size:11px;fill:#666}.chart .ttl{font-size:13px;font-weight:600;fill:#1f2328}
 .tw{overflow-x:auto}table{border-collapse:collapse;font-size:.85rem;background:#fff}
-th,td{border:1px solid #e3e3e0;padding:3px 6px}td{white-space:nowrap}th{background:#f0f0ec;text-align:left;vertical-align:bottom;font-size:.78rem;line-height:1.35;min-width:4.4em;max-width:7.5em}td.c{text-align:center}td.w{white-space:normal;min-width:30em}td.t{white-space:normal;overflow-wrap:anywhere;max-width:16em}
+th,td{border:1px solid #e3e3e0;padding:3px 6px}td{white-space:nowrap}th{background:#f0f0ec;text-align:left;vertical-align:bottom;font-size:.78rem;line-height:1.35;min-width:4.4em;max-width:7.5em}td.c{text-align:center}td.t{white-space:normal;overflow-wrap:anywhere;max-width:16em}
 td.n{text-align:right}.heat{width:100%;table-layout:fixed}.heat th,.heat td{min-width:0;max-width:none;padding:3px 0;text-align:center;font-size:.72rem;white-space:nowrap}.heat th:first-child{width:4.2em}
 .barc{display:inline-flex;align-items:center;gap:4px}.bv{min-width:3.2em;text-align:right;font-variant-numeric:tabular-nums}
 .bar{display:inline-block;width:56px;height:8px;background:#eee;border-radius:4px;vertical-align:middle}
@@ -448,10 +499,16 @@ def main():
                     help="プロジェクト ID と名前の対応表（ID<TAB>名前）。あれば ID の代わりに名前を表示（既定 projects.tsv）")
     ap.add_argument("--wait-weeks", type=int, default=13,
                     help="待ち時間のプロジェクト内訳を見る期間（直近の週数、既定 13 ≒ 3 か月。0 で全期間）")
-    ap.add_argument("--runner-top", type=int, default=15, help="runner 別の表示件数（既定 15）")
     ap.add_argument("--project-top", type=int, default=10, help="プロジェクト別の表示件数（既定 10）")
     ap.add_argument("--merge-parallel", action="store_true",
                     help="parallel / matrix で分かれたジョブ（'rspec 1/4'、'test: [a, b]'）を 1 つにまとめる")
+    ap.add_argument("--pool-re",
+                    help="runner 名から消す部分の正規表現（例: '-[0-9a-z]+-[0-9a-z]{5}$'）。"
+                         "省略時は末尾のハッシュらしい部分を自動で除く")
+    ap.add_argument("--pool-limit-weeks", type=int, default=3,
+                    help="プールの上限の目安 = 週ごとの最大同時実行数の上から N 番目（既定 3。1 回だけの突出を除くため）")
+    ap.add_argument("--team-depth", type=int, default=2,
+                    help="プロジェクトのパスの何階層目までをチームとみなすか（既定 2: mygroup/team1）")
     ap.add_argument("--outdir", default="report")
     a = ap.parse_args()
     try:
@@ -465,6 +522,9 @@ def main():
         sys.exit(f"入力ファイルが見つかりません: {' '.join(a.inputs)}")
     print(f"入力: {len(files)} ファイル（{os.path.basename(files[0])} 〜 {os.path.basename(files[-1])}）")
     rows, alljobs = load(files, tzoff)
+    pool_of = make_pool_fn(a.pool_re)
+    for j in alljobs:
+        j.pool = pool_of(j.runner)
     usable = [j for j in alljobs if j.s is not None and j.e is not None and j.e > j.s]
     n_nostart = sum(1 for j in alljobs if j.s is None)
     n_running = sum(1 for j in alljobs if j.s is not None and j.e is None)
@@ -508,6 +568,16 @@ def main():
     def plabel(pid):
         return short.get(pid, pid)
 
+    def team_of(pid):
+        """プロジェクトのパスからチーム（サブグループ）を取る。mygroup 直下のプロジェクトは mygroup。"""
+        path = pname.get(pid)
+        if not path:
+            return "(名前不明)"
+        parts = path.split("/")
+        if len(parts) > a.team_depth:
+            return "/".join(parts[:a.team_depth])
+        return "/".join(parts[:-1]) or path
+
     # ジョブの集計単位
     par_re = re.compile(r"( \d+/\d+|: \[.*\])$")   # parallel の " 1/4"、matrix の ": [a, b]"
 
@@ -520,7 +590,7 @@ def main():
         def keyfn(j):
             return (j.project, norm(j.name))
 
-    # --- タグ（runner プール）別 ---
+    # --- タグ別 ---
     tagstat = defaultdict(lambda: {"sec": 0.0, "n": 0, "proj": set(), "jobs": []})
     for j in usable:
         t = tagstat[j.tags]
@@ -565,6 +635,22 @@ def main():
     weekly = weekly_table(busy, hmax, busyset, h0, usable)
     week_idx = {w["week"]: i for i, w in enumerate(weekly)}
 
+    def widx_of_hour(k):
+        return week_idx[(EPOCH + timedelta(days=day_info((h0 + k) // 24)[2])).isoformat()]
+
+    def widx_of_job(j):
+        return week_idx.get((EPOCH + timedelta(days=day_info(int(j.s // 86400))[2])).isoformat())
+
+    def busy_overlap(j):
+        """ジョブのうち混雑する時間帯に重なっていた秒数"""
+        t = 0.0
+        for h in range(int(j.s // 3600), int(j.e // 3600) + 1):
+            if busyset[h - h0]:
+                ov = min(j.e, (h + 1) * 3600) - max(j.s, h * 3600)
+                if ov > 0:
+                    t += ov
+        return t
+
     # 同時実行数が上限に達していた時間（上限 = --capacity、なければ期間中の最大値）
     limit = int(a.capacity) if a.capacity else base["max"]
     at_lim = time_at_limit(usable, limit, h0, n)
@@ -572,8 +658,7 @@ def main():
         w["limit_min"] = 0.0
     for k in range(n):
         if at_lim[k]:
-            _, _, wk, _ = day_info((h0 + k) // 24)
-            weekly[week_idx[(EPOCH + timedelta(days=wk)).isoformat()]]["limit_min"] += at_lim[k] / 60
+            weekly[widx_of_hour(k)]["limit_min"] += at_lim[k] / 60
 
     # --- 待ち時間の長いジョブのプロジェクト内訳（直近 --wait-weeks 週）---
     wait_from = (h0 + n) * 3600 - a.wait_weeks * 7 * 86400 if a.wait_weeks else -math.inf
@@ -597,6 +682,100 @@ def main():
                           "job_share": ws["n"] / len(wjobs) * 100 if wjobs else 0})
     wait_period = (f"{(EPOCH + timedelta(days=int(max(wait_from, h0 * 3600) // 86400))):%Y/%m/%d} 〜 "
                    f"{(EPOCH + timedelta(days=(h0 + n - 1) // 24)):%Y/%m/%d}")
+    recent_k0 = max(0, int(wait_from // 3600) - h0) if wait_from != -math.inf else 0
+
+    # --- runner プール別 ---
+    pjobs = defaultdict(list)
+    for j in usable:
+        pjobs[j.pool].append(j)
+    pool_rows, over_rows = [], []
+    for pool, pj in sorted(pjobs.items(), key=lambda kv: -sum(j.e - j.s for j in kv[1])):
+        sec = sum(j.e - j.s for j in pj)
+        _, phm = concurrency(pj, h0, n, need_busy=False)
+        wpk = [0] * len(weekly)
+        for k, v in enumerate(phm):
+            if v:
+                i = widx_of_hour(k)
+                if v > wpk[i]:
+                    wpk[i] = v
+        sp = sorted((v for v in wpk if v), reverse=True)
+        lim = sp[min(a.pool_limit_weeks, len(sp)) - 1] if sp else 0
+        atl = time_at_limit(pj, lim, h0, n) if lim else [0.0] * n
+        bsec = sum(busy_overlap(j) for j in pj)
+        bavg = bsec / (nb * 3600) if nb else 0
+        rq = sorted(j.queued for j in pj if j.s >= wait_from and j.queued is not None)
+        nlong = sum(1 for q in rq if q > wait_thr)
+        wq_ = [[] for _ in weekly]
+        for j in pj:
+            if j.queued is not None:
+                i = widx_of_job(j)
+                if i is not None:
+                    wq_[i].append(j.queued)
+        hsp = sorted(phm)
+        ids = {j.runner_id for j in pj if j.runner_id}
+        pool_rows.append({
+            "pool": pool, "n": len(pj), "ids": len(ids), "hours": sec / 3600, "share": sec / total_sec * 100,
+            "peak": hsp[-1], "p99": percentile(hsp, 99), "lim": lim,
+            "busy_avg": bavg, "fill": bavg / lim * 100 if lim else 0,
+            "at_lim_min": sum(atl[recent_k0:]) / 60,
+            "p50": percentile(rq, 50), "p95": percentile(rq, 95),
+            "long": nlong, "long_share": nlong / n_long * 100 if n_long else 0,
+            "wpeak": wpk, "wp95": [percentile(sorted(x), 95) if x else None for x in wq_],
+        })
+        # 上限の目安を超えた時間：そのとき動いていた runner ID を記録（新旧 runner の重なりの確認用）
+        if lim:
+            over = {k: v for k, v in enumerate(phm) if v > lim}
+            if over:
+                act = defaultdict(set)
+                for j in pj:
+                    for h in range(int(j.s // 3600), int(j.e // 3600) + 1):
+                        if h - h0 in over:
+                            act[h - h0].add(j.runner_id or "?")
+                for k, v in over.items():
+                    over_rows.append([pool, (EPOCH_DT + timedelta(hours=h0 + k)).strftime("%Y-%m-%d %H:00"),
+                                      v, lim, len(act[k]), " ".join(sorted(act[k], key=lambda x: (len(x), x)))])
+    over_rows.sort(key=lambda r: (-r[2], r[1]))
+
+    # runner 名 → プールの対応（runner ごとの稼働期間も出す。入れ替わりの間隔の確認用）
+    rmap = {}
+    for j in usable:
+        key = (j.pool, j.runner, j.runner_id)
+        m = rmap.get(key)
+        if m is None:
+            rmap[key] = [1, j.s, j.e]
+        else:
+            m[0] += 1
+            m[1] = min(m[1], j.s)
+            m[2] = max(m[2], j.e)
+
+    def dts(sec):
+        return (EPOCH_DT + timedelta(seconds=sec)).strftime("%Y-%m-%d %H:%M")
+    map_rows = sorted([[p, r, rid, c, dts(s), dts(e), round((e - s) / 86400, 1)]
+                       for (p, r, rid), (c, s, e) in rmap.items()], key=lambda r: (r[0], r[4]))
+
+    # チーム × プール（直近 --wait-weeks 週）
+    top_pools = [r["pool"] for r in pool_rows[:6]]
+    tstat = defaultdict(lambda: {"n": 0, "sec": 0.0, "q": [], "long": 0, "pool": Counter()})
+    for j in usable:
+        if j.s < wait_from:
+            continue
+        ts = tstat[team_of(j.project)]
+        ts["n"] += 1
+        ts["sec"] += j.e - j.s
+        ts["pool"][j.pool] += j.e - j.s
+        if j.queued is not None:
+            ts["q"].append(j.queued)
+            if j.queued > wait_thr:
+                ts["long"] += 1
+    team_rows = []
+    for team, ts in sorted(tstat.items(), key=lambda kv: -kv[1]["sec"]):
+        q = sorted(ts["q"])
+        other = ts["sec"] - sum(ts["pool"][p] for p in top_pools)
+        team_rows.append({"team": team, "n": ts["n"], "hours": ts["sec"] / 3600,
+                          "p50": percentile(q, 50), "p95": percentile(q, 95),
+                          "long_share": ts["long"] / n_long * 100 if n_long else 0,
+                          "pools": [ts["pool"][p] / ts["sec"] * 100 if ts["sec"] else 0 for p in top_pools],
+                          "other": other / ts["sec"] * 100 if ts["sec"] else 0})
 
     # 曜日×時間帯（直近 12 週）
     cells_sum = [[0.0] * 24 for _ in range(7)]
@@ -625,12 +804,7 @@ def main():
             st["fail"] += 1
         st["projsec"][j.project] += j.e - j.s
         st["months"][day_info(int(j.s // 86400))[3]] += d
-        s, e = j.s, j.e
-        for h in range(int(s // 3600), int(e // 3600) + 1):
-            if busyset[h - h0]:
-                ov = min(e, (h + 1) * 3600) - max(s, h * 3600)
-                if ov > 0:
-                    st["busy"] += ov
+        st["busy"] += busy_overlap(j)
     ranking = sorted(stats.items(), key=lambda kv: -kv[1]["busy"])
 
     # --- プロジェクト別 ---
@@ -645,17 +819,11 @@ def main():
         ps["n"] += 1
         ps["names"].add(j.name)
         ps["jobs"].append(j)
-        _, _, wk, mon = day_info(int(j.s // 86400))
-        i = week_idx.get((EPOCH + timedelta(days=wk)).isoformat())
+        i = widx_of_job(j)
         if i is not None:
             ps["weekly"][i] += d / 3600
-        ps["months"][mon] += d
-        s, e = j.s, j.e
-        for h in range(int(s // 3600), int(e // 3600) + 1):
-            if busyset[h - h0]:
-                ov = min(e, (h + 1) * 3600) - max(s, h * 3600)
-                if ov > 0:
-                    ps["busy"] += ov
+        ps["months"][day_info(int(j.s // 86400))[3]] += d
+        ps["busy"] += busy_overlap(j)
     pranking = sorted(pstats.items(), key=lambda kv: -kv[1]["busy"])
     proj_rows = []
     for rank, (pid, ps) in enumerate(pranking):
@@ -671,65 +839,6 @@ def main():
                           "busy_share": ps["busy"] / busy_sec * 100 if busy_sec else 0,
                           "avg": avg, "busy_avg": busy_avg, "p99": p99, "peak": peak,
                           "weekly": ps["weekly"], "months": ps["months"]})
-
-    # --- runner 別 ---
-    rstat = {}
-    for j in usable:
-        rs = rstat.get(j.runner)
-        if rs is None:
-            rs = rstat[j.runner] = {"sec": 0.0, "n": 0, "proj": Counter(), "tags": Counter(), "q": [], "jobs": [],
-                                    "first": j.s, "last": j.s}
-        d = j.e - j.s
-        rs["sec"] += d
-        rs["n"] += 1
-        rs["proj"][j.project] += d
-        rs["tags"][j.tags or "(タグなし)"] += 1
-        rs["jobs"].append(j)
-        if j.queued is not None:
-            rs["q"].append(j.queued)
-        rs["first"] = min(rs["first"], j.s)
-        rs["last"] = max(rs["last"], j.s)
-    runner_rows = []
-    for rank, (rn, rs) in enumerate(sorted(rstat.items(), key=lambda kv: -kv[1]["sec"])):
-        peak = p99 = None
-        wpeak = None
-        if rank < a.runner_top and rn != "(不明)":
-            _, rhm = concurrency(rs["jobs"], h0, n, need_busy=False)
-            sr = sorted(rhm)
-            peak, p99 = sr[-1], percentile(sr, 99)
-            wpeak = [0] * len(weekly)
-            for k, v in enumerate(rhm):
-                if v:
-                    _, _, wk, _ = day_info((h0 + k) // 24)
-                    i = week_idx[(EPOCH + timedelta(days=wk)).isoformat()]
-                    wpeak[i] = max(wpeak[i], v)
-        q = sorted(rs["q"])
-        runner_rows.append({"name": rn, "n": rs["n"], "hours": rs["sec"] / 3600, "share": rs["sec"] / total_sec * 100,
-                            "projects": len(rs["proj"]), "peak": peak, "p99": p99, "wpeak": wpeak,
-                            "q50": percentile(q, 50), "q95": percentile(q, 95),
-                            "tags": rs["tags"].most_common(1)[0][0],
-                            "first": day_info(int(rs["first"] // 86400))[0], "last": day_info(int(rs["last"] // 86400))[0],
-                            "proj": rs["proj"]})
-
-    # プロジェクト × runner（プロジェクトごとに、どの runner で何割動いたか）
-    pr = defaultdict(Counter)
-    for j in usable:
-        pr[j.project][j.runner] += j.e - j.s
-    proj_runner_rows = []
-    for pid, c in pr.items():
-        tot = sum(c.values())
-        for rn, sec in c.most_common():
-            proj_runner_rows.append([pid, plabel(pid), rn, round(sec / 3600, 2), round(sec / tot * 100, 2)])
-
-    def runner_mix(pid, top=3):
-        c = pr.get(pid)
-        if not c:
-            return "-"
-        tot = sum(c.values())
-        parts = [f"{html.escape(rn)} <b>{sec / tot * 100:.0f}%</b>" for rn, sec in c.most_common(top)]
-        if len(c) > top:
-            parts.append(f"ほか {len(c) - top} 台")
-        return "<span>" + "　/　".join(parts) + "</span>"
 
     # --- what-if（--exclude）---
     whatif = None
@@ -759,6 +868,9 @@ def main():
             w.writerow(headers)
             w.writerows(rows_)
 
+    def rnd(v, d=1):
+        return None if v is None else round(v, d)
+
     wcsv("weekly.csv", ["週(月曜)", "ジョブ数", "占有時間h", "平均同時実行", "最大同時実行",
                         "混雑する時間帯の時間数", "待ちp50秒", "待ちp95秒", f"同時実行{limit}以上の時間(分)"],
          [[w["week"], w["jobs"], round(w["runner_h"], 2), round(w["avg_conc"], 3), w["peak_conc"],
@@ -767,14 +879,28 @@ def main():
                                  f"長い待ち(>{wait_thr:.0f}秒)の件数", "長い待ちに占める割合%", "全ジョブに占める割合%"],
          [[r["pid"], r["name"], r["n"], r["p50"], r["p95"], r["long"], round(r["long_share"], 2),
            round(r["job_share"], 2)] for r in wait_rows])
-    wcsv("runners.csv", ["runner", "ジョブ数", "占有時間h", "割合%", "プロジェクト数", "最大同時実行", "同時実行p99",
-                         "待ちp50秒", "待ちp95秒", "主なタグ", "最初のジョブ", "最後のジョブ"],
-         [[r["name"], r["n"], round(r["hours"], 2), round(r["share"], 2), r["projects"], r["peak"], r["p99"],
-           r["q50"], r["q95"], r["tags"], r["first"], r["last"]] for r in runner_rows])
-    wcsv("project_runner.csv", ["プロジェクトID", "プロジェクト", "runner", "占有時間h", "そのプロジェクト内の割合%"],
-         proj_runner_rows)
     wcsv("tags.csv", ["タグ", "ジョブ数", "占有時間h", "割合%", "プロジェクト数", "最大同時実行", "同時実行p99"],
          [[r[0], r[1], round(r[2], 2), round(r[3], 2), r[4], r[5], r[6]] for r in tag_rows])
+    wcsv("pools.csv", ["プール", "runner ID 数", "ジョブ数", "占有時間h", "割合%", "最大同時実行", "同時実行p99",
+                       "上限の目安", "混雑する時間帯の平均同時実行", "混雑する時間帯の埋まり具合%",
+                       "直近 上限到達(分)", "直近 待ちp50秒", "直近 待ちp95秒", "直近 長い待ちの件数",
+                       "直近 長い待ちに占める割合%"],
+         [[r["pool"], r["ids"], r["n"], round(r["hours"], 2), round(r["share"], 2), r["peak"], r["p99"], r["lim"],
+           round(r["busy_avg"], 3), round(r["fill"], 1), round(r["at_lim_min"], 1), r["p50"], r["p95"],
+           r["long"], round(r["long_share"], 2)] for r in pool_rows])
+    pw_pools = pool_rows[:10]
+    wcsv("pool_weekly.csv", ["週(月曜)"] + [f"{r['pool']} 最大同時" for r in pw_pools]
+         + [f"{r['pool']} 待ちp95秒" for r in pw_pools],
+         [[w["week"]] + [r["wpeak"][i] for r in pw_pools] + [rnd(r["wp95"][i]) for r in pw_pools]
+          for i, w in enumerate(weekly)])
+    wcsv("pool_map.csv", ["プール", "runner 名", "runner ID", "ジョブ数", "最初のジョブ開始", "最後のジョブ終了", "稼働日数"],
+         map_rows)
+    wcsv("pool_over_limit.csv", ["プール", "時刻", "最大同時実行", "上限の目安", "動いていた runner ID 数", "runner ID"],
+         over_rows)
+    wcsv("team_pool.csv", ["チーム", "ジョブ数", "占有時間h", "待ちp50秒", "待ちp95秒", "長い待ちに占める割合%"]
+         + [f"{p} %" for p in top_pools] + ["その他 %"],
+         [[r["team"], r["n"], round(r["hours"], 2), r["p50"], r["p95"], round(r["long_share"], 2)]
+          + [round(x, 1) for x in r["pools"]] + [round(r["other"], 1)] for r in team_rows])
     rank_rows = []
     for (_, name), st in ranking:
         ds = sorted(st["durs"])
@@ -820,6 +946,7 @@ def main():
     first = (EPOCH + timedelta(days=h0 // 24)).isoformat()
     last = (EPOCH + timedelta(days=(h0 + n - 1) // 24)).isoformat()
     cap = a.capacity
+    palette = ["#2563eb", "#dc2626", "#16a34a", "#f59e0b", "#7c3aed"]
     footnote = (f"<p class='fn'>※混雑する時間帯：1 時間ごとの runner 稼働（平均同時実行数）が多い時間のうち、"
                 f"上位 {a.busy_pct:g}% の時間</p>")
     H = [f"<!doctype html><html lang='ja'><head><meta charset='utf-8'>"
@@ -867,31 +994,55 @@ def main():
     H.append("<h2>3. 曜日 × 時刻の平均同時実行数（直近 12 週）</h2>")
     H.append(heatmap(cells))
 
-    palette5 = ["#2563eb", "#dc2626", "#16a34a", "#f59e0b", "#7c3aed"]
-    H.append("<h2>4. タグ（runner プール）別</h2>")
+    H.append("<h2>4. タグ別</h2>")
     H.append(table(["タグ", "ジョブ数", "占有時間h", "割合", "プロジェクト数", "最大同時", "同時p99"],
                    [[r[0], f"{r[1]:,}", fnum(r[2]), bar(r[3]), r[4], r[5] if r[5] is not None else "-",
                      r[6] if r[6] is not None else "-"] for r in tag_rows[:15]]))
 
-    H.append(f"<h2>5. runner 別（占有時間の順・上位 {a.runner_top}）</h2>")
-    rtop = [r for r in runner_rows if r["wpeak"] is not None][:5]
-    if rtop:
-        H.append(svg_line("上位 5 runner の週ごとの最大同時実行数", "ジョブ数", labels,
-                          [(r["name"][-28:], r["wpeak"], palette5[i]) for i, r in enumerate(rtop)], tips=wtips))
-    H.append(table(["runner", "ジョブ数", "占有h", "全体に占める割合", "プロジェクト数", "最大同時", "同時p99",
-                    "待ち p50（秒）", "待ち p95（秒）", "主なタグ", "稼働期間"],
-                   [[r["name"], f"{r['n']:,}", fnum(r["hours"]), bar(r["share"]), r["projects"],
-                     "-" if r["peak"] is None else r["peak"], "-" if r["p99"] is None else r["p99"],
-                     fnum(r["q50"]), fnum(r["q95"]), r["tags"], f"{r['first']:%y/%m/%d}〜{r['last']:%y/%m/%d}"]
-                    for r in runner_rows[:a.runner_top]]))
-    H.append("<p class='fn'>※(不明)：削除済みの runner で動いたジョブ（複数 runner の合算のため、同時実行数は出していません）</p>")
-    H.append(f"<h3>プロジェクトごとの使用 runner（6 章の上位 {a.project_top} プロジェクト）</h3>")
-    H.append(table(["プロジェクト", "使った runner 数", "runner ごとの占有の割合（上位 3）"],
-                   [[r["name"], len(pr.get(r["pid"], {})), runner_mix(r["pid"])] for r in proj_rows[:a.project_top]]))
+    # ---- 5. runner プール別
+    H.append("<h2>5. runner プール別</h2>")
+    H.append("<p class='note'>プール＝runner 名から末尾のハッシュを除いたもの。runner が登録し直されて名前や ID が変わっても、"
+             "同じプールとしてまとめています。まとめ方は pool_map.csv で確認できます（違っていれば --pool-re で指定）。</p>")
+    H.append(table(["プール", "runner ID 数", "ジョブ数", "占有h", "割合", "最大同時", "同時p99", "上限の目安※1",
+                    "混雑する時間帯※の平均同時", "混雑する時間帯※の埋まり具合※2", "直近 上限到達（分）",
+                    "直近 待ち p50（秒）", "直近 待ち p95（秒）", "直近 長い待ち※3に占める割合"],
+                   [[r["pool"], r["ids"], f"{r['n']:,}", fnum(r["hours"]), bar(r["share"]), r["peak"], r["p99"],
+                     r["lim"], fnum(r["busy_avg"], 2), bar(r["fill"]), fnum(r["at_lim_min"]),
+                     fnum(r["p50"]), fnum(r["p95"]), bar(r["long_share"])] for r in pool_rows[:15]]))
+    H.append(f"<p class='fn'>※1 上限の目安：週ごとの最大同時実行数の上から {a.pool_limit_weeks} 番目。"
+             f"そのプールの concurrent の推定値（1 回だけの突出は除く）。頻繁に上限に達していないプールでは実際より小さく出ます</p>"
+             "<p class='fn'>※2 埋まり具合：混雑する時間帯の平均同時実行数 ÷ 上限の目安。"
+             "全体が混んでいる時間に、そのプールがどれだけ埋まっていたか（低いプールは空いていた）</p>"
+             f"<p class='fn'>※3 長い待ち・直近：{wait_period} の全ジョブの待ち時間 p95（{wait_thr:.0f} 秒）を超えたもの。"
+             f"ジョブを拾ったプールで数えています</p>")
+    H.append(footnote)
+    ptop5 = pool_rows[:5]
+    H.append(svg_line("プール別の最大同時実行数（週ごと）", "ジョブ数", labels,
+                      [(r["pool"][-28:], r["wpeak"], palette[i]) for i, r in enumerate(ptop5)], tips=wtips))
+    H.append(svg_line("プール別の待ち時間 p95（週ごと）", "秒", labels,
+                      [(r["pool"][-28:], r["wp95"], palette[i]) for i, r in enumerate(ptop5)], tips=wtips))
+
+    H.append(f"<h3>チーム × プール（{wait_period}）</h3>")
+    H.append("<p class='note'>チーム＝プロジェクトのパスの上から "
+             f"{a.team_depth} 階層。各チームの runner 使用時間がどのプールに乗っていたかの割合。</p>")
+    H.append(table(["チーム", "ジョブ数", "占有h", "待ち p50（秒）", "待ち p95（秒）", "長い待ち※3に占める割合"]
+                   + [p[-24:] for p in top_pools] + ["その他"],
+                   [[r["team"], f"{r['n']:,}", fnum(r["hours"]), fnum(r["p50"]), fnum(r["p95"]), bar(r["long_share"])]
+                    + [f"{x:.0f}%" if x >= 0.5 else "-" for x in r["pools"]]
+                    + [f"{r['other']:.0f}%" if r["other"] >= 0.5 else "-"] for r in team_rows[:15]]))
+
+    H.append("<h3>上限の目安を超えた時間（上位 20）</h3>")
+    if over_rows:
+        H.append("<p class='note'>runner ID が 2 つ以上動いていれば、runner の入れ替わり（新旧の重なり）で一時的に枠が増えたと考えられます。"
+                 "全件は pool_over_limit.csv。</p>")
+        H.append(table(["プール", "時刻", "最大同時", "上限の目安", "動いていた runner ID 数", "runner ID"],
+                       [r[:5] + [r[5] if len(r[5]) <= 60 else r[5][:60] + " …"] for r in over_rows[:20]],
+                       num_from=2, center={4}))
+    else:
+        H.append("<p class='note'>該当なし</p>")
 
     H.append(f"<h2>6. プロジェクト別（混雑する時間帯に占める割合の順・上位 {a.project_top}）</h2>")
     ptop = proj_rows[:a.project_top]
-    palette = palette5
     H.append(svg_line("上位 5 プロジェクトの週あたり占有時間", "時間/週", labels,
                       [(r["name"][-24:], r["weekly"], palette[i]) for i, r in enumerate(ptop[:5])], tips=wtips))
     ph = ["プロジェクト", "回数", "ジョブ種類", "占有h", "全時間帯に占める割合", "混雑する時間帯※に占める割合", "平均同時", "混雑する時間帯※の平均同時", "同時p99", "最大同時"]
@@ -937,6 +1088,10 @@ def main():
     # ------------------------------------------------------------- 画面には要点だけ
     print(f"期間 {first} 〜 {last}  総占有 {total_sec / 3600:,.0f} h  平均同時 {base['avg']:.2f}  "
           f"混雑する時間帯の平均同時 {base['busy_avg']:.2f}  最大 {base['max']}")
+    print(f"runner プール: {len(pool_rows)} 個（runner 名 {len(map_rows)} 個をまとめた結果）")
+    for r in pool_rows[:8]:
+        print(f"  {r['pool'][:40]:<40}  runner ID {r['ids']:>3}  上限の目安 {r['lim']:>3}  "
+              f"混雑時の埋まり {r['fill']:5.1f}%  直近 待ちp95 {fnum(r['p95']):>6} 秒")
     if whatif:
         print(f"削減後: 混雑する時間帯の平均同時 {whatif['busy_avg']:.2f}  最大 {whatif['max']}  削減 {whatif['saved_h']:,.0f} h")
     print(f"出力: {os.path.join(a.outdir, 'report.html')}")
