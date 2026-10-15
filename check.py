@@ -521,6 +521,9 @@ def main():
                     help="自動で選ぶとき、runner・プロジェクト名がそろっているジョブの割合が何 %% 以上の週を使うか（既定 80）")
     ap.add_argument("--pool-limit-weeks", type=int, default=3,
                     help="プールの上限の目安 = 週ごとの最大同時実行数の上から N 番目（既定 3。1 回だけの突出を除くため）")
+    ap.add_argument("--teams", default="teams.csv",
+                    help="プロジェクト ID とチーム名の対応表（ID,チーム名 の CSV。既定 teams.csv）。"
+                         "あればプロジェクトのパスより優先してチーム名に使う")
     ap.add_argument("--team-depth", type=int, default=2,
                     help="プロジェクトのパスの何階層目までをチームとみなすか（既定 2: mygroup/team1）")
     ap.add_argument("--outdir", default="report")
@@ -603,8 +606,19 @@ def main():
     def plabel(pid):
         return short.get(pid, pid)
 
+    # チーム名の対応表（任意）。ID,チーム名 の CSV。1 行目が見出しでも、BOM 付きでも読める
+    tname = {}
+    if a.teams and os.path.isfile(a.teams):
+        with open(a.teams, encoding="utf-8-sig", errors="replace", newline="") as f:
+            for row in csv.reader(f):
+                if len(row) >= 2 and row[0].strip().isdigit() and row[1].strip():
+                    tname[row[0].strip()] = row[1].strip()
+        print(f"チーム名: {a.teams} から {len(tname)} 件")
+
     def team_of(pid):
-        """プロジェクトのパスからチーム（サブグループ）を取る。mygroup 直下のプロジェクトは mygroup。"""
+        """チーム名。teams.csv にあればその名前、なければプロジェクトのパスから取る（mygroup/team1 など）。"""
+        if pid in tname:
+            return tname[pid]
         path = pname.get(pid)
         if not path:
             return "(名前不明)"
@@ -721,7 +735,7 @@ def main():
 
     # --- runner プール別（runner・プロジェクト名の情報がそろっている直近の期間だけ）---
     def known(j):
-        return bool(j.runner_id or j.runner) and (not pname or j.project in pname)
+        return bool(j.runner_id or j.runner) and ((not pname and not tname) or j.project in pname or j.project in tname)
     wk_tot, wk_ok = [0] * len(weekly), [0] * len(weekly)
     for j in usable:
         i = widx_of_job(j)
@@ -760,6 +774,13 @@ def main():
                    f"{(EPOCH + timedelta(days=(h0 + n - 1) // 24)):%Y/%m/%d}")
     print(f"プール別の集計期間: {pool_period}（{len(pool_usable):,} ジョブ、"
           f"runner・プロジェクト名がそろっている割合 {pool_cov:.0f}%）")
+
+    if tname:
+        miss = Counter(j.project for j in pool_usable if j.project not in tname)
+        if miss:
+            print(f"注意: teams.csv にないプロジェクト {len(miss)} 件（この期間の {sum(miss.values()):,} ジョブ）: "
+                  + ", ".join(f"{plabel(pid)}({pid})" for pid, _ in miss.most_common(10))
+                  + (" …" if len(miss) > 10 else ""))
 
     pjobs = defaultdict(list)
     for j in pool_usable:
