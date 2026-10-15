@@ -22,7 +22,9 @@ GitLab CI ジョブ履歴（jobs_all.tsv）から runner の占有状況を集�
   projects_monthly.csv  プロジェクト別の月別占有時間
   tags.csv           タグ別の占有時間
   pools.csv          runner プール（runner 名からハッシュを除いたもの）別の占有・上限・待ち時間
-  pool_weekly.csv    プール別の週ごとの最大同時実行数・待ち時間 p95
+  job_runner.csv     ジョブごとの runner と所属グループ（プール別の期間のみ）
+  pipeline_runner.csv  パイプラインごとに、どのプールでジョブが何本実行されたか
+  project_pool.csv   プロジェクト × プールのジョブ数
   pool_map.csv       runner 名・runner ID → プールの対応（ハッシュの除き方の確認用）
   pool_over_limit.csv  プールの上限の目安を超えた時間と、そのとき動いていた runner ID
   team_pool.csv      チーム（プロジェクトのサブグループ）× プールの使用割合
@@ -62,7 +64,7 @@ WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
 
 # ------------------------------------------------------------------ 読み込み
 class Job:
-    __slots__ = ("jid", "project", "name", "stage", "status", "s", "e", "queued", "tags",
+    __slots__ = ("jid", "pipeline", "project", "name", "stage", "status", "s", "e", "queued", "tags",
                  "runner_id", "runner", "pool")
 
 
@@ -123,6 +125,7 @@ def _load_one(path, tzoff, best):
             j.tags = r["tags"]
             j.runner_id = r["runner_id"].strip()
             j.runner = r["runner"].strip()
+            j.pipeline = r["pipeline_id"].strip()
             j.pool = ""
             old = best.get(jid)
             # 同じジョブが複数期間に出たら、終了しているほうを採用
@@ -848,6 +851,36 @@ def main():
                           "pools": [ts["pool"][p] / ts["sec"] * 100 if ts["sec"] else 0 for p in top_pools],
                           "other": other / ts["sec"] * 100 if ts["sec"] else 0})
 
+    # プロジェクト × プール（ジョブ数ベース）
+    ppstat = defaultdict(lambda: {"n": 0, "q": [], "pool": Counter()})
+    for j in pool_usable:
+        pp = ppstat[j.project]
+        pp["n"] += 1
+        pp["pool"][j.pool] += 1
+        if j.queued is not None:
+            pp["q"].append(j.queued)
+    projpool_rows = []
+    for pid, pp in sorted(ppstat.items(), key=lambda kv: -kv[1]["n"]):
+        other = pp["n"] - sum(pp["pool"][p] for p in top_pools)
+        projpool_rows.append({"pid": pid, "name": plabel(pid), "team": team_of(pid), "n": pp["n"],
+                              "p95": percentile(sorted(pp["q"]), 95),
+                              "pools": [pp["pool"][p] / pp["n"] * 100 for p in top_pools],
+                              "other": other / pp["n"] * 100, "counts": pp["pool"]})
+
+    # パイプライン単位：どのプールで実行されたか
+    plstat = {}
+    for j in pool_usable:
+        key = (j.project, j.pipeline)
+        pl = plstat.get(key)
+        if pl is None:
+            pl = plstat[key] = {"n": 0, "s": j.s, "e": j.e, "qmax": 0.0, "pool": Counter()}
+        pl["n"] += 1
+        pl["s"] = min(pl["s"], j.s)
+        pl["e"] = max(pl["e"], j.e)
+        pl["pool"][j.pool] += 1
+        if j.queued is not None and j.queued > pl["qmax"]:
+            pl["qmax"] = j.queued
+
     # 曜日×時間帯（直近 12 週）
     cells_sum = [[0.0] * 24 for _ in range(7)]
     cells_cnt = [[0] * 24 for _ in range(7)]
@@ -959,11 +992,20 @@ def main():
          [[r["pool"], r["ids"], r["n"], round(r["hours"], 2), round(r["share"], 2), r["peak"], r["p99"], r["lim"],
            round(r["busy_avg"], 3), round(r["fill"], 1), round(r["at_lim_min"], 1), r["p50"], r["p95"],
            r["long"], round(r["long_share"], 2)] for r in pool_rows])
-    pw_pools = pool_rows[:10]
-    wcsv("pool_weekly.csv", ["週(月曜)"] + [f"{r['pool']} 最大同時" for r in pw_pools]
-         + [f"{r['pool']} 待ちp95秒" for r in pw_pools],
-         [[w["week"]] + [r["wpeak"][i] for r in pw_pools] + [rnd(r["wp95"][i]) for r in pw_pools]
-          for i, w in enumerate(weekly[pool_w0:])])
+    wcsv("job_runner.csv", ["job_id", "pipeline_id", "プロジェクトID", "プロジェクト", "チーム", "ジョブ名", "開始",
+                            "待ち秒", "実行秒", "runner_id", "runner 名", "プール（runner の所属グループ）"],
+         [[j.jid, j.pipeline, j.project, plabel(j.project), team_of(j.project), j.name, dts(j.s),
+           j.queued, round(j.e - j.s), j.runner_id, j.runner, j.pool]
+          for j in sorted(pool_usable, key=lambda x: x.s)])
+    wcsv("pipeline_runner.csv", ["pipeline_id", "プロジェクトID", "プロジェクト", "チーム", "開始", "終了", "ジョブ数",
+                                 "最大待ち秒", "プール数", "プール別ジョブ数"],
+         [[pl_id, pid, plabel(pid), team_of(pid), dts(pl["s"]), dts(pl["e"]), pl["n"], round(pl["qmax"], 1),
+           len(pl["pool"]), " / ".join(f"{k}: {v}" for k, v in pl["pool"].most_common())]
+          for (pid, pl_id), pl in sorted(plstat.items(), key=lambda kv: kv[1]["s"])])
+    wcsv("project_pool.csv", ["プロジェクトID", "プロジェクト", "チーム", "ジョブ数", "待ちp95秒"]
+         + [f"{p} ジョブ数" for p in top_pools] + ["その他 ジョブ数"],
+         [[r["pid"], r["name"], r["team"], r["n"], r["p95"]] + [r["counts"][p] for p in top_pools]
+          + [r["n"] - sum(r["counts"][p] for p in top_pools)] for r in projpool_rows])
     wcsv("coverage_weekly.csv", ["週(月曜)", "ジョブ数", "runner・プロジェクト名がそろっているジョブ数", "割合%"],
          [[w["week"], wk_tot[i], wk_ok[i], round(wk_ok[i] / wk_tot[i] * 100, 1) if wk_tot[i] else None]
           for i, w in enumerate(weekly)])
@@ -1053,10 +1095,6 @@ def main():
     H.append(svg_line("runner に拾われるまでの待ち時間", "秒",
                       labels, [("p95", [w["queued_p95_s"] for w in weekly], "#dc2626"),
                                ("p50", [w["queued_p50_s"] for w in weekly], "#2563eb")], tips=wtips))
-    H.append(svg_line(f"同時実行数が上限（{limit}）に達していた時間", "分/週", labels,
-                      [("上限到達", [w["limit_min"] for w in weekly], "#dc2626")], tips=wtips))
-    if not cap:
-        H.append(f"<p class='fn'>※上限：--capacity の指定がないため、期間中の最大同時実行数（{limit}）を上限とみなしています</p>")
 
     H.append(f"<h2>2. 待ち時間の長いジョブのプロジェクト内訳（{wait_period}）</h2>")
     H.append(table(["プロジェクト", "ジョブ数", "待ち p50（秒）", "待ち p95（秒）", "長い待ち※の件数",
@@ -1075,42 +1113,34 @@ def main():
 
     # ---- 5. runner プール別
     H.append(f"<h2>5. runner プール別（{pool_period}）</h2>")
-    H.append(f"<p class='note'>runner の情報やプロジェクト名が残っていない古いジョブを避けるため、"
-             f"情報がそろっている直近の期間だけで集計しています（この期間でそろっている割合 {pool_cov:.0f}%）。"
-             f"週ごとの割合は coverage_weekly.csv、期間は --pool-since で指定できます。"
-             f"割合・混雑する時間帯もこの期間の中で計算しています。</p>")
-    H.append("<p class='note'>プール＝runner の所属グループ（runners.tsv にある runner）。"
-             "runners.tsv にない runner は、runner 名から末尾のハッシュを除いたもの。"
-             "runner が登録し直されて名前や ID が変わっても、同じプールとしてまとめています。"
-             "対応は pool_map.csv で確認できます。</p>"
-             f"<p class='note'>プールの決め方（全期間の全ジョブ）: {html.escape(by_txt)}</p>")
+    H.append(f"<p class='note'>プール＝runner の所属グループ。runner の情報が残っている直近の期間だけで集計"
+             f"（期間は --pool-since で変更可）。</p>")
     H.append(table(["プール", "runner ID 数", "ジョブ数", "占有h", "割合", "最大同時", "同時p99", "上限の目安※1",
-                    "混雑する時間帯※の平均同時", "混雑する時間帯※の埋まり具合※2", "上限到達（分）",
+                    "混雑時※の平均同時", "混雑時※の埋まり具合※2", "上限到達（分）",
                     "待ち p50（秒）", "待ち p95（秒）", "長い待ち※3に占める割合"],
                    [[r["pool"], r["ids"], f"{r['n']:,}", fnum(r["hours"]), bar(r["share"]), r["peak"], r["p99"],
                      r["lim"], fnum(r["busy_avg"], 2), bar(r["fill"]), fnum(r["at_lim_min"]),
                      fnum(r["p50"]), fnum(r["p95"]), bar(r["long_share"])] for r in pool_rows[:15]]))
-    H.append(f"<p class='fn'>※1 上限の目安：週ごとの最大同時実行数の上から {a.pool_limit_weeks} 番目。"
-             f"そのプールの concurrent の推定値（1 回だけの突出は除く）。頻繁に上限に達していないプールでは実際より小さく出ます</p>"
-             "<p class='fn'>※2 埋まり具合：混雑する時間帯の平均同時実行数 ÷ 上限の目安。"
-             "全体が混んでいる時間に、そのプールがどれだけ埋まっていたか（低いプールは空いていた）</p>"
-             f"<p class='fn'>※3 長い待ち：{pool_period} の全ジョブの待ち時間 p95（{pool_wait_thr:.0f} 秒）を超えたもの。"
-             f"ジョブを拾ったプールで数えています</p>")
-    H.append(footnote)
-    ptop5 = pool_rows[:5]
-    H.append(svg_line("プール別の最大同時実行数（週ごと）", "ジョブ数", labels[pool_w0:],
-                      [(r["pool"][-28:], r["wpeak"], palette[i]) for i, r in enumerate(ptop5)], tips=wtips[pool_w0:]))
-    H.append(svg_line("プール別の待ち時間 p95（週ごと）", "秒", labels[pool_w0:],
-                      [(r["pool"][-28:], r["wp95"], palette[i]) for i, r in enumerate(ptop5)], tips=wtips[pool_w0:]))
+    H.append(f"<p class='fn'>※ 混雑時：全体の同時実行数が上位 {a.busy_pct:g}% の時間"
+             f"　※1 週ごとの最大同時実行数の上から {a.pool_limit_weeks} 番目（concurrent の推定値）"
+             f"　※2 混雑時の平均同時 ÷ 上限の目安"
+             f"　※3 待ち時間が期間全体の p95（{pool_wait_thr:.0f} 秒）を超えたジョブ</p>")
 
     H.append(f"<h3>チーム × プール（{pool_period}）</h3>")
-    H.append("<p class='note'>チーム＝プロジェクトのパスの上から "
-             f"{a.team_depth} 階層。各チームの runner 使用時間がどのプールに乗っていたかの割合。</p>")
+    H.append("<p class='note'>各チームの runner 使用時間が、どのプールで実行されたかの割合。</p>")
     H.append(table(["チーム", "ジョブ数", "占有h", "待ち p50（秒）", "待ち p95（秒）", "長い待ち※3に占める割合"]
                    + [p[-24:] for p in top_pools] + ["その他"],
                    [[r["team"], f"{r['n']:,}", fnum(r["hours"]), fnum(r["p50"]), fnum(r["p95"]), bar(r["long_share"])]
                     + [f"{x:.0f}%" if x >= 0.5 else "-" for x in r["pools"]]
                     + [f"{r['other']:.0f}%" if r["other"] >= 0.5 else "-"] for r in team_rows[:15]]))
+
+    H.append(f"<h3>プロジェクト × プール（{pool_period}・ジョブ数の多い順に上位 {a.project_top}）</h3>")
+    H.append("<p class='note'>各プロジェクトのジョブがどのプールで実行されたかの割合（ジョブ数）。"
+             "ジョブ・パイプライン単位の一覧は job_runner.csv / pipeline_runner.csv。</p>")
+    H.append(table(["プロジェクト", "チーム", "ジョブ数", "待ち p95（秒）"] + [p[-24:] for p in top_pools] + ["その他"],
+                   [[r["name"], r["team"], f"{r['n']:,}", fnum(r["p95"])]
+                    + [f"{x:.0f}%" if x >= 0.5 else "-" for x in r["pools"]]
+                    + [f"{r['other']:.0f}%" if r["other"] >= 0.5 else "-"] for r in projpool_rows[:a.project_top]]))
 
     H.append("<h3>上限の目安を超えた時間（上位 20）</h3>")
     if over_rows:
