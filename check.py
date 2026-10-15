@@ -50,7 +50,7 @@ WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
 
 # ------------------------------------------------------------------ 読み込み
 class Job:
-    __slots__ = ("jid", "project", "name", "stage", "status", "s", "e", "queued", "tags")
+    __slots__ = ("jid", "project", "name", "stage", "status", "s", "e", "queued", "tags", "runner")
 
 
 def parse_ts(s):
@@ -108,6 +108,11 @@ def _load_one(path, tzoff, best):
             j.e = e + tzoff if e is not None else None
             j.queued = to_float(r["queued_duration"])
             j.tags = r["tags"]
+            rid, rdesc = r["runner_id"].strip(), r["runner"].strip()
+            if rid:
+                j.runner = f"{rdesc} (#{rid})" if rdesc else f"#{rid}"
+            else:
+                j.runner = "(不明)"          # 削除済み runner など
             old = best.get(jid)
             # 同じジョブが複数期間に出たら、終了しているほうを採用
             if old is None or (old.e is None and j.e is not None):
@@ -278,13 +283,24 @@ def svg_line(title, unit, labels, series, height=250, tips=None):
     step = max(1, math.ceil(n / 10))
     for i in range(0, n, step):
         p.append(f'<text x="{x(i):.1f}" y="{H - B + 18}" class="ax" text-anchor="middle">{html.escape(labels[i])}</text>')
-    lx = L
-    for name, vs, color in series:
+    def tw(t):   # 凡例文字のおおよその幅（px）
+        return sum(6.5 if ord(ch) < 128 else 11 for ch in t)
+    pos, lx, row = [], L, 0
+    for name, _, _ in series:
+        w = 16 + tw(name) + 18
+        if lx + w > W - R and lx > L:
+            lx, row = L, row + 1
+        pos.append((lx, row))
+        lx += w
+    extra = row * 16
+    for (name, vs, color), (px, prow) in zip(series, pos):
         pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(vs) if v is not None)
         p.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2"/>')
-        p.append(f'<rect x="{lx}" y="{H - 14}" width="12" height="4" fill="{color}"/>'
-                 f'<text x="{lx + 16}" y="{H - 9}" class="ax">{html.escape(name)}</text>')
-        lx += 30 + 13 * len(name)
+        ly = H - 14 + prow * 16
+        p.append(f'<rect x="{px}" y="{ly}" width="12" height="4" fill="{color}"/>'
+                 f'<text x="{px + 16}" y="{ly + 5}" class="ax">{html.escape(name)}</text>')
+    if extra:
+        p[0] = p[0].replace(f'viewBox="0 0 {W} {H}"', f'viewBox="0 0 {W} {H + extra}"', 1)
     # ホバー用（JS で動かす）
     p.append(f'<line class="xh" x1="0" x2="0" y1="{T}" y2="{H - B}" visibility="hidden"/>')
     for _, _, color in series:
@@ -365,6 +381,8 @@ def table(headers, rows, num_from=1, center=()):
     def cls(i, c):
         if isinstance(c, str) and c.startswith("<span class='barc'"):
             return "b"
+        if isinstance(c, str) and c.startswith("<span>"):
+            return "w"
         if i in center:
             return "c"
         return "n" if i >= num_from else "t"
@@ -387,7 +405,7 @@ CSS = """
 body{font-family:system-ui,-apple-system,"Segoe UI","Hiragino Sans","Yu Gothic UI",sans-serif;
  margin:0;background:#f7f7f5;color:#1f2328;line-height:1.6}
 main{max-width:1180px;margin:0 auto;padding:24px 16px 64px}
-h1{font-size:1.5rem;margin:0 0 4px}h2{font-size:1.15rem;margin:36px 0 8px;border-bottom:1px solid #ddd;padding-bottom:4px}
+h1{font-size:1.5rem;margin:0 0 4px}h3{font-size:.95rem;margin:20px 0 6px}h2{font-size:1.15rem;margin:36px 0 8px;border-bottom:1px solid #ddd;padding-bottom:4px}
 .sub{color:#666;font-size:.9rem}.note{color:#555;font-size:.85rem}
 .kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin:16px 0}
 .kpi div{background:#fff;border:1px solid #e3e3e0;border-radius:8px;padding:10px 12px}
@@ -395,7 +413,7 @@ h1{font-size:1.5rem;margin:0 0 4px}h2{font-size:1.15rem;margin:36px 0 8px;border
 .chart{width:100%;height:auto;background:#fff;border:1px solid #e3e3e0;border-radius:8px;margin:8px 0}
 .chart .grid{stroke:#eee}.chart .ax{font-size:11px;fill:#666}.chart .ttl{font-size:13px;font-weight:600;fill:#1f2328}
 .tw{overflow-x:auto}table{border-collapse:collapse;font-size:.85rem;background:#fff}
-th,td{border:1px solid #e3e3e0;padding:3px 6px}td{white-space:nowrap}th{background:#f0f0ec;text-align:left;vertical-align:bottom;font-size:.78rem;line-height:1.35;min-width:4.4em;max-width:7.5em}td.c{text-align:center}td.t{white-space:normal;overflow-wrap:anywhere;max-width:16em}
+th,td{border:1px solid #e3e3e0;padding:3px 6px}td{white-space:nowrap}th{background:#f0f0ec;text-align:left;vertical-align:bottom;font-size:.78rem;line-height:1.35;min-width:4.4em;max-width:7.5em}td.c{text-align:center}td.w{white-space:normal;min-width:30em}td.t{white-space:normal;overflow-wrap:anywhere;max-width:16em}
 td.n{text-align:right}.heat{width:100%;table-layout:fixed}.heat th,.heat td{min-width:0;max-width:none;padding:3px 0;text-align:center;font-size:.72rem;white-space:nowrap}.heat th:first-child{width:4.2em}
 .barc{display:inline-flex;align-items:center;gap:4px}.bv{min-width:3.2em;text-align:right;font-variant-numeric:tabular-nums}
 .bar{display:inline-block;width:56px;height:8px;background:#eee;border-radius:4px;vertical-align:middle}
@@ -430,6 +448,7 @@ def main():
                     help="プロジェクト ID と名前の対応表（ID<TAB>名前）。あれば ID の代わりに名前を表示（既定 projects.tsv）")
     ap.add_argument("--wait-weeks", type=int, default=13,
                     help="待ち時間のプロジェクト内訳を見る期間（直近の週数、既定 13 ≒ 3 か月。0 で全期間）")
+    ap.add_argument("--runner-top", type=int, default=15, help="runner 別の表示件数（既定 15）")
     ap.add_argument("--project-top", type=int, default=10, help="プロジェクト別の表示件数（既定 10）")
     ap.add_argument("--merge-parallel", action="store_true",
                     help="parallel / matrix で分かれたジョブ（'rspec 1/4'、'test: [a, b]'）を 1 つにまとめる")
@@ -653,6 +672,65 @@ def main():
                           "avg": avg, "busy_avg": busy_avg, "p99": p99, "peak": peak,
                           "weekly": ps["weekly"], "months": ps["months"]})
 
+    # --- runner 別 ---
+    rstat = {}
+    for j in usable:
+        rs = rstat.get(j.runner)
+        if rs is None:
+            rs = rstat[j.runner] = {"sec": 0.0, "n": 0, "proj": Counter(), "tags": Counter(), "q": [], "jobs": [],
+                                    "first": j.s, "last": j.s}
+        d = j.e - j.s
+        rs["sec"] += d
+        rs["n"] += 1
+        rs["proj"][j.project] += d
+        rs["tags"][j.tags or "(タグなし)"] += 1
+        rs["jobs"].append(j)
+        if j.queued is not None:
+            rs["q"].append(j.queued)
+        rs["first"] = min(rs["first"], j.s)
+        rs["last"] = max(rs["last"], j.s)
+    runner_rows = []
+    for rank, (rn, rs) in enumerate(sorted(rstat.items(), key=lambda kv: -kv[1]["sec"])):
+        peak = p99 = None
+        wpeak = None
+        if rank < a.runner_top and rn != "(不明)":
+            _, rhm = concurrency(rs["jobs"], h0, n, need_busy=False)
+            sr = sorted(rhm)
+            peak, p99 = sr[-1], percentile(sr, 99)
+            wpeak = [0] * len(weekly)
+            for k, v in enumerate(rhm):
+                if v:
+                    _, _, wk, _ = day_info((h0 + k) // 24)
+                    i = week_idx[(EPOCH + timedelta(days=wk)).isoformat()]
+                    wpeak[i] = max(wpeak[i], v)
+        q = sorted(rs["q"])
+        runner_rows.append({"name": rn, "n": rs["n"], "hours": rs["sec"] / 3600, "share": rs["sec"] / total_sec * 100,
+                            "projects": len(rs["proj"]), "peak": peak, "p99": p99, "wpeak": wpeak,
+                            "q50": percentile(q, 50), "q95": percentile(q, 95),
+                            "tags": rs["tags"].most_common(1)[0][0],
+                            "first": day_info(int(rs["first"] // 86400))[0], "last": day_info(int(rs["last"] // 86400))[0],
+                            "proj": rs["proj"]})
+
+    # プロジェクト × runner（プロジェクトごとに、どの runner で何割動いたか）
+    pr = defaultdict(Counter)
+    for j in usable:
+        pr[j.project][j.runner] += j.e - j.s
+    proj_runner_rows = []
+    for pid, c in pr.items():
+        tot = sum(c.values())
+        for rn, sec in c.most_common():
+            proj_runner_rows.append([pid, plabel(pid), rn, round(sec / 3600, 2), round(sec / tot * 100, 2)])
+
+    def runner_mix(pid, top=3):
+        c = pr.get(pid)
+        if not c:
+            return "-"
+        tot = sum(c.values())
+        parts = [f"{html.escape(rn)} <b>{sec / tot * 100:.0f}%</b>" for rn, sec in c.most_common(top)]
+        if len(c) > top:
+            parts.append(f"ほか {len(c) - top} 台")
+        return "<span>" + "　/　".join(parts) + "</span>"
+
     # --- what-if（--exclude）---
     whatif = None
     if a.exclude:
@@ -689,6 +767,12 @@ def main():
                                  f"長い待ち(>{wait_thr:.0f}秒)の件数", "長い待ちに占める割合%", "全ジョブに占める割合%"],
          [[r["pid"], r["name"], r["n"], r["p50"], r["p95"], r["long"], round(r["long_share"], 2),
            round(r["job_share"], 2)] for r in wait_rows])
+    wcsv("runners.csv", ["runner", "ジョブ数", "占有時間h", "割合%", "プロジェクト数", "最大同時実行", "同時実行p99",
+                         "待ちp50秒", "待ちp95秒", "主なタグ", "最初のジョブ", "最後のジョブ"],
+         [[r["name"], r["n"], round(r["hours"], 2), round(r["share"], 2), r["projects"], r["peak"], r["p99"],
+           r["q50"], r["q95"], r["tags"], r["first"], r["last"]] for r in runner_rows])
+    wcsv("project_runner.csv", ["プロジェクトID", "プロジェクト", "runner", "占有時間h", "そのプロジェクト内の割合%"],
+         proj_runner_rows)
     wcsv("tags.csv", ["タグ", "ジョブ数", "占有時間h", "割合%", "プロジェクト数", "最大同時実行", "同時実行p99"],
          [[r[0], r[1], round(r[2], 2), round(r[3], 2), r[4], r[5], r[6]] for r in tag_rows])
     rank_rows = []
@@ -783,14 +867,31 @@ def main():
     H.append("<h2>3. 曜日 × 時刻の平均同時実行数（直近 12 週）</h2>")
     H.append(heatmap(cells))
 
+    palette5 = ["#2563eb", "#dc2626", "#16a34a", "#f59e0b", "#7c3aed"]
     H.append("<h2>4. タグ（runner プール）別</h2>")
     H.append(table(["タグ", "ジョブ数", "占有時間h", "割合", "プロジェクト数", "最大同時", "同時p99"],
                    [[r[0], f"{r[1]:,}", fnum(r[2]), bar(r[3]), r[4], r[5] if r[5] is not None else "-",
                      r[6] if r[6] is not None else "-"] for r in tag_rows[:15]]))
 
-    H.append(f"<h2>5. プロジェクト別（混雑する時間帯に占める割合の順・上位 {a.project_top}）</h2>")
+    H.append(f"<h2>5. runner 別（占有時間の順・上位 {a.runner_top}）</h2>")
+    rtop = [r for r in runner_rows if r["wpeak"] is not None][:5]
+    if rtop:
+        H.append(svg_line("上位 5 runner の週ごとの最大同時実行数", "ジョブ数", labels,
+                          [(r["name"][-28:], r["wpeak"], palette5[i]) for i, r in enumerate(rtop)], tips=wtips))
+    H.append(table(["runner", "ジョブ数", "占有h", "全体に占める割合", "プロジェクト数", "最大同時", "同時p99",
+                    "待ち p50（秒）", "待ち p95（秒）", "主なタグ", "稼働期間"],
+                   [[r["name"], f"{r['n']:,}", fnum(r["hours"]), bar(r["share"]), r["projects"],
+                     "-" if r["peak"] is None else r["peak"], "-" if r["p99"] is None else r["p99"],
+                     fnum(r["q50"]), fnum(r["q95"]), r["tags"], f"{r['first']:%y/%m/%d}〜{r['last']:%y/%m/%d}"]
+                    for r in runner_rows[:a.runner_top]]))
+    H.append("<p class='fn'>※(不明)：削除済みの runner で動いたジョブ（複数 runner の合算のため、同時実行数は出していません）</p>")
+    H.append(f"<h3>プロジェクトごとの使用 runner（6 章の上位 {a.project_top} プロジェクト）</h3>")
+    H.append(table(["プロジェクト", "使った runner 数", "runner ごとの占有の割合（上位 3）"],
+                   [[r["name"], len(pr.get(r["pid"], {})), runner_mix(r["pid"])] for r in proj_rows[:a.project_top]]))
+
+    H.append(f"<h2>6. プロジェクト別（混雑する時間帯に占める割合の順・上位 {a.project_top}）</h2>")
     ptop = proj_rows[:a.project_top]
-    palette = ["#2563eb", "#dc2626", "#16a34a", "#f59e0b", "#7c3aed"]
+    palette = palette5
     H.append(svg_line("上位 5 プロジェクトの週あたり占有時間", "時間/週", labels,
                       [(r["name"][-24:], r["weekly"], palette[i]) for i, r in enumerate(ptop[:5])], tips=wtips))
     ph = ["プロジェクト", "回数", "ジョブ種類", "占有h", "全時間帯に占める割合", "混雑する時間帯※に占める割合", "平均同時", "混雑する時間帯※の平均同時", "同時p99", "最大同時"]
@@ -806,7 +907,7 @@ def main():
     H.append(table(ph, prows_html, center={4}))
     H.append(footnote)
 
-    H.append(f"<h2>6. ジョブ別の占有（混雑する時間帯に占める割合の順・上位 {a.top}）</h2>")
+    H.append(f"<h2>7. ジョブ別の占有（混雑する時間帯に占める割合の順・上位 {a.top}）</h2>")
     H.append(table(["ジョブ名", "ステージ", "プロジェクト数", "回数", "占有h", "全時間帯に占める割合",
                     "混雑する時間帯※に占める割合", "平均分", "p95分", "failed率"],
                    [[r[0], r[1], r[2], f"{r[3]:,}", fnum(r[4]), f"{r[5]:.1f}%", bar(r[7]), fnum(r[8]), fnum(r[9]),
@@ -814,7 +915,7 @@ def main():
     H.append(footnote)
 
     if whatif:
-        H.append("<h2>7. 指定したジョブを削った場合（--exclude）</h2>")
+        H.append("<h2>8. 指定したジョブを削った場合（--exclude）</h2>")
         H.append(f"<p class='note'>指定: {html.escape(' , '.join(a.exclude))} → 該当 {len(whatif['keys'])} 種類・{whatif['n_removed']:,} 件</p>")
         rows6 = [["総占有時間h", fnum(total_sec / 3600), fnum(total_sec / 3600 - whatif["saved_h"])],
                  ["平均同時実行数", fnum(base["avg"], 2), fnum(whatif["avg"], 2)],
