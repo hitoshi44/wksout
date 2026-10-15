@@ -11,6 +11,7 @@ GitLab CI ジョブ履歴（jobs_all.tsv）から runner の占有状況を集�
   python ci_usage.py --exclude "123:e2e-*" --exclude "*:nightly-*"
                                                           # 「プロジェクトID:ジョブ名」で削った場合を試算
   python ci_usage.py --pool-re "-[0-9a-z]+-[0-9a-z]{5}$"  # runner 名から除く部分を自分で指定
+  （runners.tsv があれば、runner の所属グループをプールにする。make_runners.sh で作成）
 
 出力（--outdir、既定 report/）:
   report.html        グラフと表のまとめ（ブラウザで開く）
@@ -32,7 +33,8 @@ GitLab CI ジョブ履歴（jobs_all.tsv）から runner の占有状況を集�
   - 占有時間 = ジョブの started_at〜finished_at の合計（runner の枠を埋めていた時間）
   - 同時実行数 = その時点で走っていたジョブ数
   - 混雑する時間帯 = 1 時間平均の同時実行数が全時間の上位 --busy-pct %（既定 10%）の時間
-  - プール = runner 名の末尾のハッシュ（Pod 名の ReplicaSet ハッシュ・ランダム文字列など）を除いたもの。
+  - プール = runner の所属グループ（runners.tsv があるとき）。
+    runners.tsv にない runner は、runner 名の末尾のハッシュを除いたもの。
     runner が登録し直されて名前や ID が変わっても、同じプールとしてまとめる
   - CPU・メモリ使用量そのものではない点に注意
 """
@@ -505,6 +507,9 @@ def main():
     ap.add_argument("--pool-re",
                     help="runner 名から消す部分の正規表現（例: '-[0-9a-z]+-[0-9a-z]{5}$'）。"
                          "省略時は末尾のハッシュらしい部分を自動で除く")
+    ap.add_argument("--runners", default="runners.tsv",
+                    help="runner ID と所属グループの対応表（make_runners.sh で作成、既定 runners.tsv）。"
+                         "あれば所属グループをプールにする")
     ap.add_argument("--pool-limit-weeks", type=int, default=3,
                     help="プールの上限の目安 = 週ごとの最大同時実行数の上から N 番目（既定 3。1 回だけの突出を除くため）")
     ap.add_argument("--team-depth", type=int, default=2,
@@ -523,8 +528,29 @@ def main():
     print(f"入力: {len(files)} ファイル（{os.path.basename(files[0])} 〜 {os.path.basename(files[-1])}）")
     rows, alljobs = load(files, tzoff)
     pool_of = make_pool_fn(a.pool_re)
+    rgroup = {}
+    if a.runners and os.path.isfile(a.runners):
+        with open(a.runners, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                c = line.rstrip("\r\n").split("\t")
+                if len(c) >= 3 and c[0].strip() and c[1] != "error":
+                    kind = {"group_type": "group", "project_type": "project",
+                            "instance_type": "instance"}.get(c[1], c[1])
+                    rgroup[c[0].strip()] = f"{c[2]}（{kind}）" if c[2] else f"（{kind}）"
+        print(f"runner の所属: {a.runners} から {len(rgroup)} 件")
+    n_by = Counter()
     for j in alljobs:
-        j.pool = pool_of(j.runner)
+        if j.runner_id and j.runner_id in rgroup:
+            j.pool = rgroup[j.runner_id]
+            n_by["所属グループ"] += 1
+        elif not j.runner_id and not j.runner:
+            j.pool = "(runner 不明)"
+            n_by["runner 情報なし"] += 1
+        else:
+            j.pool = pool_of(j.runner) if j.runner else f"(所属未取得 #{j.runner_id})"
+            n_by["runner 名から推定"] += 1
+    by_txt = " / ".join(f"{k} {v:,} 件" for k, v in n_by.most_common())
+    print("プールの決め方: " + by_txt)
     usable = [j for j in alljobs if j.s is not None and j.e is not None and j.e > j.s]
     n_nostart = sum(1 for j in alljobs if j.s is None)
     n_running = sum(1 for j in alljobs if j.s is not None and j.e is None)
@@ -1001,8 +1027,11 @@ def main():
 
     # ---- 5. runner プール別
     H.append("<h2>5. runner プール別</h2>")
-    H.append("<p class='note'>プール＝runner 名から末尾のハッシュを除いたもの。runner が登録し直されて名前や ID が変わっても、"
-             "同じプールとしてまとめています。まとめ方は pool_map.csv で確認できます（違っていれば --pool-re で指定）。</p>")
+    H.append("<p class='note'>プール＝runner の所属グループ（runners.tsv にある runner）。"
+             "runners.tsv にない runner は、runner 名から末尾のハッシュを除いたもの。"
+             "runner が登録し直されて名前や ID が変わっても、同じプールとしてまとめています。"
+             "対応は pool_map.csv で確認できます。</p>"
+             f"<p class='note'>プールの決め方（全ジョブ）: {html.escape(by_txt)}</p>")
     H.append(table(["プール", "runner ID 数", "ジョブ数", "占有h", "割合", "最大同時", "同時p99", "上限の目安※1",
                     "混雑する時間帯※の平均同時", "混雑する時間帯※の埋まり具合※2", "直近 上限到達（分）",
                     "直近 待ち p50（秒）", "直近 待ち p95（秒）", "直近 長い待ち※3に占める割合"],
