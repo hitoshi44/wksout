@@ -76,6 +76,30 @@ def parse_group(text):
         sys.exit(f"正規表現の誤り [{label}] {pat}: {ex}")
 
 
+def load_names(path):
+    """プロジェクト ID → 名前。CSV（proj-id,proj-name）でも TSV でも読む。見出し行は自動で飛ばす。"""
+    if not path:
+        path = next((p for p in ("projects.csv", "projects.tsv") if os.path.isfile(p)), None)
+        if not path:
+            return {}
+    elif not os.path.isfile(path):
+        sys.exit(f"対応表が見つかりません: {path}")
+    with open(path, encoding="utf-8-sig", errors="replace", newline="") as f:
+        text = f.read()
+    first = text.splitlines()[0] if text else ""
+    delim = "\t" if first.count("\t") > first.count(",") else ","
+    names = {}
+    for c in csv.reader(text.splitlines(), delimiter=delim):
+        if len(c) < 2:
+            continue
+        pid, nm = c[0].strip(), c[1].strip()
+        if not pid.isdigit() or not nm:      # 見出し行（proj-id など）や空行は飛ばす
+            continue
+        names[pid] = nm
+    print(f"プロジェクト名: {path} から {len(names)} 件")
+    return names
+
+
 # ------------------------------------------------------------------ HTML
 CSS = """
 body{font-family:system-ui,-apple-system,"Segoe UI","Hiragino Sans","Yu Gothic UI",sans-serif;
@@ -225,7 +249,8 @@ def main():
     ap.add_argument("--tz", type=float, default=9, help="UTC からの時差（既定 9）")
     ap.add_argument("--project-top", type=int, default=15, help="プロジェクト × 時刻の表に出すプロジェクト数（既定 15）")
     ap.add_argument("--project-jobs", type=int, default=8, help="プロジェクトを開いたときに出すジョブ数（既定 8）")
-    ap.add_argument("--names", default="projects.tsv", help="プロジェクト ID と名前の対応表（既定 projects.tsv）")
+    ap.add_argument("--names", help="プロジェクト ID と名前の対応表（CSV / TSV、1 列目 ID・2 列目 名前）。"
+                    "省略時は projects.csv、なければ projects.tsv を探す")
     ap.add_argument("--outdir", default="report_heatmap")
     a = ap.parse_args()
     try:
@@ -272,13 +297,7 @@ def main():
     print(f"期間: {period}（{(d1 - d0) / 7:.1f} 週）")
 
     # プロジェクト名（projects.tsv があれば、パスの最後を表示。重複するときは上の階層も付ける）
-    pname = {}
-    if a.names and os.path.isfile(a.names):
-        with open(a.names, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                c = line.rstrip("\r\n").split("\t")
-                if len(c) >= 2 and c[0].strip():
-                    pname[c[0].strip()] = c[1].strip()
+    pname = load_names(a.names)
     short = {pid: path.split("/")[-1] for pid, path in pname.items()}
     for depth in range(2, 10):
         dup = Counter(short.values())
@@ -369,6 +388,10 @@ def main():
         pdata.append({"name": short.get(pid, pid), "share": sum(arr) / total_h * 100,
                       "v": [round(x, 4) for x in arr], "jobs": rows})
     n_proj = len(ptot)
+    if pname:
+        missing = [pid for pid in ptot if pid not in pname]
+        if missing:
+            print(f"対応表にないプロジェクト ID: {len(missing)} 件（ID のまま表示）例: {', '.join(missing[:5])}")
 
     # ------------------------------------------------------------- CSV
     os.makedirs(a.outdir, exist_ok=True)
