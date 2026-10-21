@@ -63,7 +63,10 @@ KEY_PHASES = {
     "integration-test", "verify", "install", "deploy", "site", "site-deploy",
 }
 
-# ライフサイクルを fork するゴール -> fork 先のフェーズ（プラグインのバージョンで異なる場合あり）
+# ライフサイクルを fork するゴール -> fork 先のフェーズ
+# 各ゴールの公式ドキュメント「Invokes the execution of the following lifecycle phase
+# prior to executing itself」の記載に基づく（maven-javadoc-plugin / maven-source-plugin の現行版）。
+# javadoc:jar / javadoc:test-jar / *-no-fork は fork しない。
 FORKS = {
     "javadoc:aggregate": "compile",
     "javadoc:aggregate-jar": "compile",
@@ -71,13 +74,9 @@ FORKS = {
     "javadoc:test-aggregate-jar": "test-compile",
     "javadoc:javadoc": "generate-sources",
     "javadoc:test-javadoc": "generate-test-sources",
-    "javadoc:jar": "generate-sources",
-    "javadoc:test-jar": "generate-test-sources",
     "source:jar": "generate-sources",
-    "source:test-jar": "generate-test-sources",
-    "jacoco:report-aggregate": None,  # fork しない（参考）
+    "source:test-jar": "generate-sources",
 }
-FORKS = {k: v for k, v in FORKS.items() if v}
 
 MAVEN_EXECUTABLES = {"mvnw", "mvn", "mvnw.cmd", "mvn.cmd", "mvnd"}
 
@@ -133,8 +132,9 @@ class Command:
     tasks: list[tuple[str, str]] = field(default_factory=list)  # ("phase"|"goal", name)
     scope: Scope = field(default_factory=lambda: Scope(None))
     profiles: list[str] = field(default_factory=list)
-    skip_tests: bool = False       # -DskipTests: テスト実行のみスキップ
-    skip_test_compile: bool = False  # -Dmaven.test.skip=true: テストのコンパイルもスキップ
+    skip_tests: bool = False       # -DskipTests: 単体テスト（surefire）の実行のみスキップ
+    skip_its: bool = False         # -DskipITs: 結合テスト（failsafe）の実行をスキップ
+    skip_test_compile: bool = False  # -Dmaven.test.skip=true: テストのコンパイルも含めて両方スキップ
     warnings: list[str] = field(default_factory=list)
     cells: dict = field(default_factory=dict)  # key -> Cell
 
@@ -269,8 +269,10 @@ def _apply_define(cmd: Command, kv: str) -> None:
     truthy = val in ("", "true")
     if key == "skipTests" and truthy:
         cmd.skip_tests = True
+    elif key == "skipITs" and truthy:
+        cmd.skip_its = True
     elif key == "maven.test.skip" and truthy:
-        cmd.skip_tests = cmd.skip_test_compile = True
+        cmd.skip_tests = cmd.skip_its = cmd.skip_test_compile = True
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +288,8 @@ def analyze(commands: list[Command]) -> None:
             cell.from_fork |= fork
             kind, name = key
             skipped = kind == "phase" and (
-                (cmd.skip_tests and name in ("test", "integration-test"))
+                (cmd.skip_tests and name == "test")
+                or (cmd.skip_its and name == "integration-test")
                 or (cmd.skip_test_compile and name in ("test-compile", "generate-test-sources",
                                                        "process-test-sources", "process-test-classes"))
             )
@@ -417,8 +420,11 @@ def render_html(commands: list[Command], cols: list[tuple[str, str]], title: str
                 badges.append("-P " + ",".join(c.profiles))
             if c.skip_test_compile:
                 badges.append("maven.test.skip")
-            elif c.skip_tests:
-                badges.append("skipTests")
+            else:
+                if c.skip_tests:
+                    badges.append("skipTests")
+                if c.skip_its:
+                    badges.append("skipITs")
             badge_html = "".join(f'<span class="badge">{esc(b)}</span>' for b in badges)
             warn_html = "".join(f'<div class="warn">⚠ {esc(w)}</div>' for w in c.warnings)
             cells = [c.cells.get(col) for col in cols]
@@ -456,7 +462,8 @@ def render_html(commands: list[Command], cols: list[tuple[str, str]], title: str
 <li>フェーズを指定すると、同じライフサイクルの前のフェーズもすべて実行される前提で展開しています。</li>
 <li>「重複」= それより前のジョブ・コマンドで、同じかより広いモジュール範囲ですでに実行済み。「一部重複」= 範囲が一部だけ重なる。</li>
 <li>「×2」= 同じコマンド内で2回実行（fork するゴールによる再実行など）。</li>
-<li>fork するゴールはよく使うものだけを登録しています（プラグインのバージョンによって異なる場合があります）。-no-fork 版は fork しません。</li>
+<li>fork するゴールは maven-javadoc-plugin / maven-source-plugin の公式ドキュメントの記載に基づいて登録しています。javadoc:jar と -no-fork 版は fork しません。</li>
+<li>-DskipTests は単体テスト（surefire）だけをスキップ扱いにしています。Failsafe 3.6.0 以降は -DskipTests で結合テストがスキップされないためです（古い Failsafe ではスキップされます）。結合テストは -DskipITs、両方は -Dmaven.test.skip=true。</li>
 <li>ジョブ間で target/ やローカルリポジトリを共有していても、Maven はフェーズを再実行します（コンパイルの差分スキップは除く）。</li>
 </ul>
 </body></html>"""
