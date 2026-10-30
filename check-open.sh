@@ -6,6 +6,7 @@
 #   ./list-public-enis.sh                 # デフォルトリージョン
 #   ./list-public-enis.sh ap-northeast-1 us-east-1
 #   ./list-public-enis.sh all             # 有効な全リージョン
+#   AWS_CMD=vltp ./list-public-enis.sh    # aws の代わりに vltp などのラッパーを使う
 #
 # 出力 (TSV):
 #   verdict  region  eni  type  instance  description  public_ipv4  ipv6  sgs  open_rules
@@ -21,11 +22,19 @@
 
 set -euo pipefail
 
+# aws の代わりに使うコマンド（例: AWS_CMD=vltp ./list-public-enis.sh）
+read -ra AWS <<< "${AWS_CMD:-aws}"
+
 if [ $# -eq 0 ]; then
-  REGIONS=("$(aws configure get region)")
+  REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-$("${AWS[@]}" configure get region 2>/dev/null | tr -d '\r' || true)}}"
+  if [ -z "$REGION" ]; then
+    echo "リージョンが決まらないので引数で指定してください" >&2
+    exit 1
+  fi
+  REGIONS=("$REGION")
 elif [ "$1" = "all" ]; then
-  mapfile -t REGIONS < <(aws ec2 describe-regions \
-    --query 'Regions[].RegionName' --output text | tr '\t' '\n')
+  mapfile -t REGIONS < <("${AWS[@]}" ec2 describe-regions \
+    --query 'Regions[].RegionName' --output text | tr -d '\r' | tr '\t' '\n')
 else
   REGIONS=("$@")
 fi
@@ -36,8 +45,8 @@ trap 'rm -rf "$TMP"' EXIT
 printf 'verdict\tregion\teni\ttype\tinstance\tdescription\tpublic_ipv4\tipv6\tsgs\topen_rules\n'
 
 for r in "${REGIONS[@]}"; do
-  aws ec2 describe-security-groups  --region "$r" --output json > "$TMP/sg.json"
-  aws ec2 describe-network-interfaces --region "$r" --output json > "$TMP/eni.json"
+  "${AWS[@]}" ec2 describe-security-groups  --region "$r" --output json > "$TMP/sg.json"
+  "${AWS[@]}" ec2 describe-network-interfaces --region "$r" --output json > "$TMP/eni.json"
 
   jq -r --arg region "$r" --slurpfile sg "$TMP/sg.json" '
     # SG ID -> ワールド開放ルールの一覧
