@@ -1,77 +1,41 @@
 #!/usr/bin/env bash
-# 直接依存（本番のみ）の EOL 状況を npm だけで判定する
+# check-eol.sh の出力を、Excel で開ける CSV（UTF-8 BOM 付き）に変換してファイルに書き出す
 #
-#   DEPRECATED : npm で非推奨になっている（確実に EOL）
-#   MAINTAINED : 非推奨でなく、最新版のリリースが MONTHS ヶ月以内（メンテ中）
-#   UNKNOWN    : どちらとも言えない → 要目視確認
-#
-# 使い方: package.json のあるディレクトリで
-#   ./check-eol.sh          # 12ヶ月基準
-#   MONTHS=24 ./check-eol.sh
-#   INCLUDE_DEV=1 ./check-eol.sh   # devDependencies も含める
-#   REGISTRY=https://registry.npmjs.org ./check-eol.sh   # 問い合わせ先を指定
+# 使い方:
+#   ./check-eol.sh | ./eol-to-csv.sh                 # → eol.csv に書き出す
+#   ./check-eol.sh | ./eol-to-csv.sh - out.csv       # → 出力先を指定
+#   ./eol-to-csv.sh result.txt                       # 保存済みの出力から変換 → eol.csv
+#   ./eol-to-csv.sh result.txt out.csv
 
-MONTHS="${MONTHS:-12}"
+in="${1:--}"
+out="${2:-eol.csv}"
 
-if [ ! -f package.json ]; then
-  echo "エラー: package.json がありません。プロジェクトのディレクトリで実行してください。" >&2
-  exit 1
-fi
-if [ ! -d node_modules ]; then
-  echo "エラー: node_modules がありません。先に npm install（または npm ci）を実行してください。" >&2
+if [ "$in" != "-" ] && [ ! -f "$in" ]; then
+  echo "エラー: 入力ファイルが見つかりません: $in" >&2
   exit 1
 fi
 
-# 基準日（MONTHS ヶ月前）を YYYY-MM-DD で求める（GNU date / macOS date 両対応）
-threshold=$(date -u -d "-${MONTHS} months" +%Y-%m-%d 2>/dev/null \
-         || date -u -v-"${MONTHS}"m +%Y-%m-%d)
+{
+  # UTF-8 BOM（Excel で日本語が文字化けしないように必須）
+  printf '\357\273\277'
 
-# 問い合わせ先レジストリ（.npmrc の社内レジストリを使わず公開 npm を見たい場合など）
-#   REGISTRY=https://registry.npmjs.org ./check-eol.sh
-reg=""
-[ -n "$REGISTRY" ] && reg="--registry=$REGISTRY"
+  # データ行（先頭が STATUS 値の行）だけを拾う
+  # 最初の5列は空白を含まないので空白で区切り、残りすべてを note とする
+  cat "$in" | awk '
+    function q(s) { gsub(/"/, "\"\"", s); return "\"" s "\"" }
+    function row(a, b, c, d, e, f) {
+      printf "%s,%s,%s,%s,%s,%s\r\n", q(a), q(b), q(c), q(d), q(e), q(f)
+    }
+    BEGIN { row("status", "package", "current", "latest", "released", "note") }
+    $1 ~ /^(DEPRECATED|MAINTAINED|UNKNOWN|ERROR)$/ {
+      note = $0
+      for (i = 1; i <= 5; i++) sub(/^[ \t]*[^ \t]+/, "", note)
+      sub(/^[ \t]+/, "", note); sub(/[ \t\r]+$/, "", note)
+      row($1, $2, $3, $4, $5, note)
+      n++
+    }
+    END { if (n == 0) print "警告: データ行が見つかりませんでした" > "/dev/stderr" }
+  '
+} > "$out"
 
-omit="--omit=dev"
-[ -n "$INCLUDE_DEV" ] && omit=""
-
-printf "レジストリ: %s\n" "${REGISTRY:-$(npm config get registry 2>/dev/null)}"
-printf "基準: 最新リリースが %s 以降なら MAINTAINED（%sヶ月以内）\n\n" "$threshold" "$MONTHS"
-printf "%-10s  %-40s  %-12s  %-12s  %-10s  %s\n" STATUS PACKAGE CURRENT LATEST RELEASED NOTE
-printf "%-10s  %-40s  %-12s  %-12s  %-10s  %s\n" ---------- ---------------------------------------- ------------ ------------ ---------- ----
-
-# npm ls の通常のツリー表示を読む（1行目はプロジェクト自身なのでスキップ）
-#   ├── react@18.3.1   /   +-- react@18.3.1   /   └── @scope/pkg@1.0.0 deduped
-npm ls --depth=0 $omit 2>/dev/null | tail -n +2 \
-| grep -v "UNMET" \
-| sed -E 's/^[^@[:alnum:]]+//' | awk '{print $1}' \
-| while IFS= read -r spec; do
-    name=${spec%@*}
-    cur=${spec##*@}
-    [ -z "$name" ] || [ -z "$cur" ] || [ "$name" = "$spec" ] && continue
-
-    out=$(npm view $reg "$name" dist-tags.latest 2>&1)
-    latest=$(printf '%s\n' "$out" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' | tail -n 1)
-    if [ -z "$latest" ]; then
-      err=$(printf '%s\n' "$out" | grep -m1 -E 'npm (ERR!|error) (code|[0-9]{3})' || printf '%s\n' "$out" | head -n 1)
-      printf "%-10s  %-40s  %-12s  %-12s  %-10s  %s\n" ERROR "$name" "$cur" "-" "-" "npm view 失敗: ${err:-（出力なし）}"
-      continue
-    fi
-
-    released=$(npm view $reg "$name" "time[$latest]" 2>/dev/null | cut -c1-10)
-    dep_cur=$(npm view $reg "$name@$cur" deprecated 2>/dev/null)
-    dep_latest=$(npm view $reg "$name@$latest" deprecated 2>/dev/null)
-
-    status=""; note=""
-    if [ -n "$dep_latest" ]; then
-      status="DEPRECATED"; note="パッケージ自体が非推奨: $dep_latest"
-    elif [ -n "$dep_cur" ]; then
-      status="DEPRECATED"; note="使用中の版が非推奨（$latest へ更新で解消）: $dep_cur"
-    elif [[ "$released" > "$threshold" || "$released" == "$threshold" ]]; then
-      status="MAINTAINED"
-      [ "${cur%%.*}" != "${latest%%.*}" ] && note="メジャー版が古い（旧版のサポート状況は要確認）"
-    else
-      status="UNKNOWN"; note="最新リリースから ${MONTHS}ヶ月以上経過 → README/Issue を要確認"
-    fi
-
-    printf "%-10s  %-40s  %-12s  %-12s  %-10s  %s\n" "$status" "$name" "$cur" "$latest" "$released" "$note"
-  done
+echo "書き出しました: $out（UTF-8 BOM 付き）" >&2
